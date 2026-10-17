@@ -7,6 +7,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -131,6 +132,82 @@ class Monitor(Base):
         nullable=True,
     )
 
+    ssl_monitoring_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        index=True,
+        nullable=False,
+    )
+
+    ssl_warning_days: Mapped[int] = mapped_column(
+        Integer,
+        default=14,
+        nullable=False,
+    )
+
+    ssl_status: Mapped[str] = mapped_column(
+        String(32),
+        default="unknown",
+        index=True,
+        nullable=False,
+    )
+
+    ssl_next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+        nullable=True,
+    )
+
+    ssl_last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    ssl_last_successful_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    ssl_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    ssl_issuer: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    ssl_subject: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    ssl_serial_number: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+
+    ssl_fingerprint_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    ssl_valid_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    ssl_error_type: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    ssl_error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
@@ -160,3 +237,16 @@ class Monitor(Base):
         back_populates="monitor",
         cascade="all, delete-orphan",
     )
+
+    ssl_checks = relationship(
+        "SSLCheck",
+        back_populates="monitor",
+        cascade="all, delete-orphan",
+    )
+
+    ssl_notifications = relationship(
+        "SSLNotificationLog",
+        back_populates="monitor",
+        cascade="all, delete-orphan",
+    )
+

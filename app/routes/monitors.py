@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
@@ -8,6 +9,7 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.models.monitor import Monitor
 from app.models.monitor_check import MonitorCheck
+from app.models.ssl_check import SSLCheck
 from app.models.user import User
 from app.schemas.monitor import (
     MonitorCheckListResponse,
@@ -17,6 +19,8 @@ from app.schemas.monitor import (
     MonitorMetricsResponse,
     MonitorResponse,
     MonitorUpdate,
+    SSLCheckHistoryResponse,
+    SSLDetailResponse,
 )
 
 
@@ -91,11 +95,19 @@ def create_monitor(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    url_str = str(payload.url)
+    ssl_enabled = payload.ssl_monitoring_enabled
+    if ssl_enabled and not url_str.lower().startswith("https://"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="SSL monitoring can only be enabled for HTTPS URLs",
+        )
+
     monitor = Monitor(
         user_id=user.id,
         type="http",
         name=payload.name.strip(),
-        url=str(payload.url),
+        url=url_str,
         interval_seconds=payload.interval_seconds,
         timeout_seconds=payload.timeout_seconds,
         expected_status_min=payload.expected_status_min,
@@ -104,6 +116,10 @@ def create_monitor(
         status="unknown",
         is_active=True,
         next_check_at=utcnow(),
+        ssl_monitoring_enabled=ssl_enabled,
+        ssl_warning_days=payload.ssl_warning_days,
+        ssl_status="unknown" if ssl_enabled else "paused",
+        ssl_next_check_at=utcnow() if ssl_enabled else None,
     )
 
     db.add(monitor)
@@ -148,6 +164,16 @@ def update_monitor(
             detail="expected_status_min must be less than or equal to expected_status_max",
         )
 
+    new_url = updates.get("url")
+    effective_url = str(new_url) if new_url is not None else monitor.url
+    effective_ssl = updates.get("ssl_monitoring_enabled", monitor.ssl_monitoring_enabled)
+
+    if effective_ssl and not effective_url.lower().startswith("https://"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="SSL monitoring can only be enabled for HTTPS URLs",
+        )
+
     state_affecting_fields = {
         "url",
         "expected_status_min",
@@ -165,9 +191,36 @@ def update_monitor(
         updates["url"] = str(updates["url"])
 
     previous_active = monitor.is_active
+    previous_url = monitor.url
+    previous_ssl_enabled = monitor.ssl_monitoring_enabled
 
     for key, value in updates.items():
         setattr(monitor, key, value)
+
+    # Invalidate stale SSL metadata if hostname changes
+    if "url" in updates and str(updates["url"]) != previous_url:
+        old_host = urlparse(previous_url).hostname
+        new_host = urlparse(str(updates["url"])).hostname
+        if old_host != new_host and monitor.ssl_monitoring_enabled:
+            monitor.ssl_status = "unknown"
+            monitor.ssl_expires_at = None
+            monitor.ssl_issuer = None
+            monitor.ssl_subject = None
+            monitor.ssl_serial_number = None
+            monitor.ssl_fingerprint_sha256 = None
+            monitor.ssl_valid_from = None
+            monitor.ssl_error_type = None
+            monitor.ssl_error_message = None
+            monitor.ssl_next_check_at = utcnow()
+
+    # Handle SSL toggle
+    if "ssl_monitoring_enabled" in updates:
+        if monitor.ssl_monitoring_enabled and not previous_ssl_enabled:
+            monitor.ssl_status = "unknown"
+            monitor.ssl_next_check_at = utcnow()
+        elif not monitor.ssl_monitoring_enabled and previous_ssl_enabled:
+            monitor.ssl_status = "paused"
+            monitor.ssl_next_check_at = None
 
     if "is_active" in updates:
         if monitor.is_active and not previous_active:
@@ -175,10 +228,16 @@ def update_monitor(
             monitor.consecutive_failures = 0
             monitor.consecutive_successes = 0
             monitor.next_check_at = utcnow()
+            if monitor.ssl_monitoring_enabled:
+                monitor.ssl_status = "unknown"
+                monitor.ssl_next_check_at = utcnow()
 
         elif not monitor.is_active:
             monitor.status = "paused"
             monitor.next_check_at = None
+            if monitor.ssl_monitoring_enabled:
+                monitor.ssl_status = "paused"
+                monitor.ssl_next_check_at = None
 
     elif monitor.is_active and reset_state:
         monitor.status = "unknown"
@@ -207,6 +266,70 @@ def delete_monitor(
     db.commit()
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{monitor_id}/ssl", response_model=SSLDetailResponse)
+def get_monitor_ssl(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    monitor = get_owned_monitor(monitor_id, user, db)
+    parsed = urlparse(monitor.url)
+    hostname = parsed.hostname or ""
+    port = parsed.port or 443
+
+    now = utcnow()
+    days_remaining = None
+    if monitor.ssl_expires_at:
+        exp = monitor.ssl_expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        delta = (exp - now).total_seconds()
+        days_remaining = int(delta // 86400)
+
+    return SSLDetailResponse(
+        monitor_id=monitor.id,
+        enabled=monitor.ssl_monitoring_enabled,
+        status=monitor.ssl_status,
+        hostname=hostname,
+        port=port,
+        issuer=monitor.ssl_issuer,
+        subject=monitor.ssl_subject,
+        valid_from=monitor.ssl_valid_from,
+        expires_at=monitor.ssl_expires_at,
+        days_remaining=days_remaining,
+        last_checked_at=monitor.ssl_last_checked_at,
+        last_successful_check_at=monitor.ssl_last_successful_check_at,
+        error_type=monitor.ssl_error_type,
+        error_message=monitor.ssl_error_message,
+        fingerprint_sha256=monitor.ssl_fingerprint_sha256,
+        serial_number=monitor.ssl_serial_number,
+    )
+
+
+@router.get("/{monitor_id}/ssl/history", response_model=SSLCheckHistoryResponse)
+def get_monitor_ssl_history(
+    monitor_id: int,
+    limit: int = Query(default=30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    get_owned_monitor(monitor_id, user, db)
+
+    checks = list(
+        db.scalars(
+            select(SSLCheck)
+            .where(SSLCheck.monitor_id == monitor_id)
+            .order_by(SSLCheck.checked_at.desc())
+            .limit(limit)
+        ).all()
+    )
+
+    return {
+        "items": checks,
+        "count": len(checks),
+    }
 
 
 @router.get("/{monitor_id}/checks", response_model=MonitorCheckListResponse)

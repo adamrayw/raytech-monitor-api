@@ -4,6 +4,7 @@ import signal
 from datetime import datetime, timezone
 
 from app.services.monitor_runner import run_due_monitors
+from app.services.ssl_service import run_due_ssl_checks
 
 
 POLL_INTERVAL_SECONDS = 10
@@ -55,6 +56,21 @@ async def worker_loop():
                             "event": "monitor_cycle",
                             "timestamp": utcnow_iso(),
                             **result,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    flush=True,
+                )
+
+            ssl_result = await run_due_ssl_checks()
+            if ssl_result.get("due", 0) > 0:
+                print(
+                    json.dumps(
+                        {
+                            "event": "ssl_cycle",
+                            "timestamp": utcnow_iso(),
+                            **ssl_result,
                         },
                         ensure_ascii=False,
                         default=str,

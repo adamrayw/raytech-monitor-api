@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, computed_field, model_validator
 
 
 class MonitorCreate(BaseModel):
@@ -19,12 +19,21 @@ class MonitorCreate(BaseModel):
         le=60000,
     )
 
+    ssl_monitoring_enabled: bool = False
+    ssl_warning_days: int = 14
+
     @model_validator(mode="after")
-    def validate_status_range(self):
+    def validate_model_fields(self):
         if self.expected_status_min > self.expected_status_max:
             raise ValueError(
                 "expected_status_min must be less than or equal to expected_status_max"
             )
+        if self.ssl_monitoring_enabled:
+            url_str = str(self.url)
+            if not url_str.lower().startswith("https://"):
+                raise ValueError("SSL monitoring can only be enabled for HTTPS URLs")
+        if self.ssl_warning_days not in (30, 14, 7, 3):
+            raise ValueError("ssl_warning_days must be one of: 30, 14, 7, 3")
         return self
 
 
@@ -45,6 +54,15 @@ class MonitorUpdate(BaseModel):
     )
 
     is_active: bool | None = None
+
+    ssl_monitoring_enabled: bool | None = None
+    ssl_warning_days: int | None = None
+
+    @model_validator(mode="after")
+    def validate_ssl_update(self):
+        if self.ssl_warning_days is not None and self.ssl_warning_days not in (30, 14, 7, 3):
+            raise ValueError("ssl_warning_days must be one of: 30, 14, 7, 3")
+        return self
 
 
 class MonitorResponse(BaseModel):
@@ -75,6 +93,26 @@ class MonitorResponse(BaseModel):
     last_success_at: datetime | None
     last_failure_at: datetime | None
     next_check_at: datetime | None
+
+    ssl_monitoring_enabled: bool = False
+    ssl_warning_days: int = 14
+    ssl_status: str = "unknown"
+    ssl_last_checked_at: datetime | None = None
+    ssl_last_successful_check_at: datetime | None = None
+    ssl_expires_at: datetime | None = None
+    ssl_issuer: str | None = None
+    ssl_subject: str | None = None
+    ssl_error_type: str | None = None
+    ssl_error_message: str | None = None
+
+    @computed_field
+    @property
+    def ssl_days_remaining(self) -> int | None:
+        if self.ssl_expires_at is None:
+            return None
+        now = datetime.now(timezone.utc)
+        delta = (self.ssl_expires_at - now).total_seconds()
+        return int(delta // 86400)
 
     created_at: datetime
     updated_at: datetime
@@ -128,4 +166,44 @@ class MonitorCheckResponse(BaseModel):
 
 class MonitorCheckListResponse(BaseModel):
     items: list[MonitorCheckResponse]
+    count: int
+
+
+class SSLDetailResponse(BaseModel):
+    monitor_id: int
+    enabled: bool
+    status: str
+    hostname: str
+    port: int = 443
+    issuer: str | None = None
+    subject: str | None = None
+    valid_from: datetime | None = None
+    expires_at: datetime | None = None
+    days_remaining: int | None = None
+    last_checked_at: datetime | None = None
+    last_successful_check_at: datetime | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    fingerprint_sha256: str | None = None
+    serial_number: str | None = None
+
+
+class SSLCheckItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    checked_at: datetime
+    status: str
+    issuer: str | None = None
+    subject: str | None = None
+    valid_from: datetime | None = None
+    expires_at: datetime | None = None
+    fingerprint_sha256: str | None = None
+    serial_number: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+class SSLCheckHistoryResponse(BaseModel):
+    items: list[SSLCheckItemResponse]
     count: int
