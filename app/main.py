@@ -14,6 +14,8 @@ from app.routes.notifications import router as notifications_router
 from app.routes.auth import router as auth_router
 from app.routes.heartbeat import router as heartbeat_router
 from app.routes.settings import router as settings_router
+from app.routes.status_pages import router as status_pages_router
+from app.routes.public_status import router as public_status_router
 
 app = FastAPI(
     title="Raytech Monitor API",
@@ -34,9 +36,11 @@ app.add_middleware(
     https_only=True,
 )
 
+allowed_origins = list({frontend_url, "http://localhost:3000", "http://127.0.0.1:3000"})
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[frontend_url],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -82,6 +86,8 @@ app.include_router(notifications_router)
 app.include_router(auth_router)
 app.include_router(heartbeat_router)
 app.include_router(settings_router)
+app.include_router(status_pages_router)
+app.include_router(public_status_router)
 
 @app.get("/")
 def root():

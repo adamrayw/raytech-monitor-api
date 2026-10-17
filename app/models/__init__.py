@@ -8,6 +8,7 @@ from app.models.ssl_notification import SSLNotificationLog
 from app.models.heartbeat_event import HeartbeatEvent
 from app.models.notification_preference import NotificationPreference
 from app.models.email_delivery import EmailDelivery
+from app.models.status_page import StatusPage, StatusPageMonitor
 
 __all__ = [
     "User",
@@ -20,5 +21,7 @@ __all__ = [
     "HeartbeatEvent",
     "NotificationPreference",
     "EmailDelivery",
+    "StatusPage",
+    "StatusPageMonitor",
 ]
 
