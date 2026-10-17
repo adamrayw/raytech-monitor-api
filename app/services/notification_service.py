@@ -71,6 +71,12 @@ def create_incident_notification(
     db.add(notification)
     db.flush()
 
+    try:
+        from app.services.email_service import enqueue_email_for_notification
+        enqueue_email_for_notification(db, notification)
+    except Exception:
+        pass
+
     return notification
 
 

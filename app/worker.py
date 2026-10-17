@@ -94,6 +94,36 @@ async def worker_loop():
                     flush=True,
                 )
 
+            # Process pending transactional email outbox
+            try:
+                from app.services.email_service import process_pending_email_deliveries
+                email_result = await asyncio.to_thread(process_pending_email_deliveries)
+                if email_result.get("processed", 0) > 0:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "email_cycle",
+                                "timestamp": utcnow_iso(),
+                                **email_result,
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                        flush=True,
+                    )
+            except Exception as email_exc:
+                print(
+                    json.dumps(
+                        {
+                            "event": "email_worker_error",
+                            "timestamp": utcnow_iso(),
+                            "error": str(email_exc)[:1000],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+
         except Exception as exc:
             print(
                 json.dumps(

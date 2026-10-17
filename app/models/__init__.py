@@ -6,6 +6,8 @@ from app.models.notification import Notification
 from app.models.ssl_check import SSLCheck
 from app.models.ssl_notification import SSLNotificationLog
 from app.models.heartbeat_event import HeartbeatEvent
+from app.models.notification_preference import NotificationPreference
+from app.models.email_delivery import EmailDelivery
 
 __all__ = [
     "User",
@@ -16,5 +18,7 @@ __all__ = [
     "SSLCheck",
     "SSLNotificationLog",
     "HeartbeatEvent",
+    "NotificationPreference",
+    "EmailDelivery",
 ]
 

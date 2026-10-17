@@ -132,6 +132,12 @@ def process_heartbeat(
                     is_read=False,
                 )
                 db.add(recovery_notif)
+                db.flush()
+                try:
+                    from app.services.email_service import enqueue_email_for_notification
+                    enqueue_email_for_notification(db, recovery_notif)
+                except Exception:
+                    pass
 
     event = HeartbeatEvent(
         monitor_id=monitor.id,
@@ -241,6 +247,12 @@ def evaluate_overdue_heartbeat(db: Session, monitor_id: int) -> bool:
             is_read=False,
         )
         db.add(notif)
+        db.flush()
+        try:
+            from app.services.email_service import enqueue_email_for_notification
+            enqueue_email_for_notification(db, notif)
+        except Exception:
+            pass
 
     event = HeartbeatEvent(
         monitor_id=monitor.id,

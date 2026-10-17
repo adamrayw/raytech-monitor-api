@@ -13,6 +13,7 @@ from app.routes.incidents import router as incidents_router
 from app.routes.notifications import router as notifications_router
 from app.routes.auth import router as auth_router
 from app.routes.heartbeat import router as heartbeat_router
+from app.routes.settings import router as settings_router
 
 app = FastAPI(
     title="Raytech Monitor API",
@@ -80,6 +81,7 @@ app.include_router(incidents_router)
 app.include_router(notifications_router)
 app.include_router(auth_router)
 app.include_router(heartbeat_router)
+app.include_router(settings_router)
 
 @app.get("/")
 def root():

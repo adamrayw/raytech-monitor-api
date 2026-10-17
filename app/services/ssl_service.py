@@ -99,6 +99,11 @@ def evaluate_ssl_result_and_notify(
             )
             db.add(notification)
             db.flush()
+            try:
+                from app.services.email_service import enqueue_email_for_notification
+                enqueue_email_for_notification(db, notification)
+            except Exception:
+                pass
 
             log_entry = SSLNotificationLog(
                 monitor_id=monitor.id,
@@ -153,6 +158,11 @@ def evaluate_ssl_result_and_notify(
                 )
                 db.add(notification)
                 db.flush()
+                try:
+                    from app.services.email_service import enqueue_email_for_notification
+                    enqueue_email_for_notification(db, notification)
+                except Exception:
+                    pass
 
                 # Record the active milestone and mark any superseded larger milestones
                 for m in eligible_milestones:
@@ -196,6 +206,11 @@ def evaluate_ssl_result_and_notify(
             )
             db.add(notification)
             db.flush()
+            try:
+                from app.services.email_service import enqueue_email_for_notification
+                enqueue_email_for_notification(db, notification)
+            except Exception:
+                pass
 
             log_entry = SSLNotificationLog(
                 monitor_id=monitor.id,
@@ -229,6 +244,11 @@ def evaluate_ssl_result_and_notify(
             )
             db.add(notification)
             db.flush()
+            try:
+                from app.services.email_service import enqueue_email_for_notification
+                enqueue_email_for_notification(db, notification)
+            except Exception:
+                pass
 
             log_entry = SSLNotificationLog(
                 monitor_id=monitor.id,
