@@ -5,6 +5,7 @@ from app.models.incident import Incident
 from app.models.notification import Notification
 from app.models.ssl_check import SSLCheck
 from app.models.ssl_notification import SSLNotificationLog
+from app.models.heartbeat_event import HeartbeatEvent
 
 __all__ = [
     "User",
@@ -14,5 +15,6 @@ __all__ = [
     "Notification",
     "SSLCheck",
     "SSLNotificationLog",
+    "HeartbeatEvent",
 ]
 

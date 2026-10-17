@@ -10,8 +10,14 @@ from app.dependencies.auth import get_current_user
 from app.models.monitor import Monitor
 from app.models.monitor_check import MonitorCheck
 from app.models.ssl_check import SSLCheck
+from app.models.heartbeat_event import HeartbeatEvent
+from app.models.incident import Incident
 from app.models.user import User
+from app.services.heartbeat_service import generate_heartbeat_token
 from app.schemas.monitor import (
+    HeartbeatEventResponse,
+    HeartbeatEventsListResponse,
+    HeartbeatRegenerateResponse,
     MonitorCheckListResponse,
     MonitorCreate,
     MonitorListResponse,
@@ -95,6 +101,33 @@ def create_monitor(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    if payload.type == "heartbeat":
+        raw_token, token_hash = generate_heartbeat_token()
+        monitor = Monitor(
+            user_id=user.id,
+            type="heartbeat",
+            name=payload.name.strip(),
+            url=None,
+            interval_seconds=payload.interval_seconds,
+            timeout_seconds=payload.timeout_seconds,
+            status="pending",
+            is_active=True,
+            next_check_at=None,
+            expected_interval_seconds=payload.expected_interval_seconds or 3600,
+            grace_period_seconds=payload.grace_period_seconds or 600,
+            heartbeat_token_hash=token_hash,
+            ssl_monitoring_enabled=False,
+            ssl_status="paused",
+            ssl_next_check_at=None,
+        )
+        db.add(monitor)
+        db.commit()
+        db.refresh(monitor)
+
+        resp = MonitorResponse.model_validate(monitor)
+        resp.heartbeat_token = raw_token
+        return resp
+
     url_str = str(payload.url)
     ssl_enabled = payload.ssl_monitoring_enabled
     if ssl_enabled and not url_str.lower().startswith("https://"):
@@ -223,21 +256,52 @@ def update_monitor(
             monitor.ssl_next_check_at = None
 
     if "is_active" in updates:
-        if monitor.is_active and not previous_active:
-            monitor.status = "unknown"
-            monitor.consecutive_failures = 0
-            monitor.consecutive_successes = 0
-            monitor.next_check_at = utcnow()
-            if monitor.ssl_monitoring_enabled:
-                monitor.ssl_status = "unknown"
-                monitor.ssl_next_check_at = utcnow()
+        if monitor.type == "heartbeat":
+            if monitor.is_active and not previous_active:
+                # Resumed: resolve any open incident, reset to pending until fresh heartbeat
+                open_inc = db.scalar(
+                    select(Incident).where(
+                        Incident.monitor_id == monitor.id,
+                        Incident.status == "open",
+                    )
+                )
+                if open_inc:
+                    open_inc.status = "resolved"
+                    open_inc.resolved_at = utcnow()
+                monitor.status = "pending"
+                monitor.next_expected_at = None
+                monitor.deadline_at = None
+                monitor.consecutive_failures = 0
+                monitor.consecutive_successes = 0
+                db.add(HeartbeatEvent(monitor_id=monitor.id, received_at=utcnow(), event_type="resumed"))
+            elif not monitor.is_active:
+                monitor.status = "paused"
+                db.add(HeartbeatEvent(monitor_id=monitor.id, received_at=utcnow(), event_type="paused"))
+        else:
+            if monitor.is_active and not previous_active:
+                monitor.status = "unknown"
+                monitor.consecutive_failures = 0
+                monitor.consecutive_successes = 0
+                monitor.next_check_at = utcnow()
+                if monitor.ssl_monitoring_enabled:
+                    monitor.ssl_status = "unknown"
+                    monitor.ssl_next_check_at = utcnow()
+            elif not monitor.is_active:
+                monitor.status = "paused"
+                monitor.next_check_at = None
+                if monitor.ssl_monitoring_enabled:
+                    monitor.ssl_status = "paused"
+                    monitor.ssl_next_check_at = None
 
-        elif not monitor.is_active:
-            monitor.status = "paused"
-            monitor.next_check_at = None
-            if monitor.ssl_monitoring_enabled:
-                monitor.ssl_status = "paused"
-                monitor.ssl_next_check_at = None
+    elif monitor.type == "heartbeat":
+        if ("expected_interval_seconds" in updates or "grace_period_seconds" in updates) and monitor.last_heartbeat_at:
+            last_hb = monitor.last_heartbeat_at
+            if last_hb.tzinfo is None:
+                last_hb = last_hb.replace(tzinfo=timezone.utc)
+            interval = monitor.expected_interval_seconds or 3600
+            grace = monitor.grace_period_seconds or 600
+            monitor.next_expected_at = last_hb + timedelta(seconds=interval)
+            monitor.deadline_at = monitor.next_expected_at + timedelta(seconds=grace)
 
     elif monitor.is_active and reset_state:
         monitor.status = "unknown"
@@ -458,3 +522,68 @@ def get_monitor_metrics(
         "max_response_ms": max_response_ms,
         "points": points,
     }
+
+
+@router.post(
+    "/{monitor_id}/heartbeat/regenerate-token",
+    response_model=HeartbeatRegenerateResponse,
+)
+def regenerate_heartbeat_token(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    monitor = get_owned_monitor(monitor_id, user, db)
+    if monitor.type != "heartbeat":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Monitor is not a heartbeat monitor",
+        )
+
+    raw_token, token_hash = generate_heartbeat_token()
+    monitor.heartbeat_token_hash = token_hash
+    db.add(
+        HeartbeatEvent(
+            monitor_id=monitor.id,
+            received_at=utcnow(),
+            event_type="token_regenerated",
+        )
+    )
+    db.commit()
+
+    return HeartbeatRegenerateResponse(
+        heartbeat_token=raw_token,
+        message="Heartbeat token regenerated successfully. Existing scripts must be updated.",
+    )
+
+
+@router.get(
+    "/{monitor_id}/heartbeat/events",
+    response_model=HeartbeatEventsListResponse,
+)
+def get_heartbeat_events(
+    monitor_id: int,
+    limit: int = Query(default=30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    monitor = get_owned_monitor(monitor_id, user, db)
+    if monitor.type != "heartbeat":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Monitor is not a heartbeat monitor",
+        )
+
+    events = list(
+        db.scalars(
+            select(HeartbeatEvent)
+            .where(HeartbeatEvent.monitor_id == monitor.id)
+            .order_by(HeartbeatEvent.received_at.desc())
+            .limit(limit)
+        ).all()
+    )
+
+    return HeartbeatEventsListResponse(
+        items=events,
+        count=len(events),
+    )

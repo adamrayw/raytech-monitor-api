@@ -5,7 +5,8 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, computed_field, mode
 
 class MonitorCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
-    url: HttpUrl
+    type: str = Field(default="http")
+    url: HttpUrl | None = None
 
     interval_seconds: int = Field(default=300, ge=60, le=86400)
     timeout_seconds: int = Field(default=10, ge=1, le=30)
@@ -22,18 +23,34 @@ class MonitorCreate(BaseModel):
     ssl_monitoring_enabled: bool = False
     ssl_warning_days: int = 14
 
+    expected_interval_seconds: int | None = Field(default=3600, ge=60, le=86400)
+    grace_period_seconds: int | None = Field(default=600, ge=60, le=86400)
+
     @model_validator(mode="after")
     def validate_model_fields(self):
-        if self.expected_status_min > self.expected_status_max:
-            raise ValueError(
-                "expected_status_min must be less than or equal to expected_status_max"
-            )
-        if self.ssl_monitoring_enabled:
-            url_str = str(self.url)
-            if not url_str.lower().startswith("https://"):
-                raise ValueError("SSL monitoring can only be enabled for HTTPS URLs")
-        if self.ssl_warning_days not in (30, 14, 7, 3):
-            raise ValueError("ssl_warning_days must be one of: 30, 14, 7, 3")
+        if self.type not in ("http", "heartbeat"):
+            raise ValueError("type must be either 'http' or 'heartbeat'")
+
+        if self.type == "http":
+            if self.url is None:
+                raise ValueError("url is required for HTTP monitors")
+            if self.expected_status_min > self.expected_status_max:
+                raise ValueError(
+                    "expected_status_min must be less than or equal to expected_status_max"
+                )
+            if self.ssl_monitoring_enabled:
+                url_str = str(self.url)
+                if not url_str.lower().startswith("https://"):
+                    raise ValueError("SSL monitoring can only be enabled for HTTPS URLs")
+            if self.ssl_warning_days not in (30, 14, 7, 3):
+                raise ValueError("ssl_warning_days must be one of: 30, 14, 7, 3")
+        elif self.type == "heartbeat":
+            if self.ssl_monitoring_enabled:
+                raise ValueError("SSL monitoring cannot be enabled for heartbeat monitors")
+            if self.expected_interval_seconds is None or self.expected_interval_seconds < 60:
+                raise ValueError("expected_interval_seconds must be at least 60 seconds")
+            if self.grace_period_seconds is None or self.grace_period_seconds < 60:
+                raise ValueError("grace_period_seconds must be at least 60 seconds")
         return self
 
 
@@ -58,6 +75,9 @@ class MonitorUpdate(BaseModel):
     ssl_monitoring_enabled: bool | None = None
     ssl_warning_days: int | None = None
 
+    expected_interval_seconds: int | None = Field(default=None, ge=60, le=86400)
+    grace_period_seconds: int | None = Field(default=None, ge=60, le=86400)
+
     @model_validator(mode="after")
     def validate_ssl_update(self):
         if self.ssl_warning_days is not None and self.ssl_warning_days not in (30, 14, 7, 3):
@@ -71,7 +91,7 @@ class MonitorResponse(BaseModel):
     id: int
     type: str
     name: str
-    url: str
+    url: str | None = None
 
     interval_seconds: int
     timeout_seconds: int
@@ -104,6 +124,13 @@ class MonitorResponse(BaseModel):
     ssl_subject: str | None = None
     ssl_error_type: str | None = None
     ssl_error_message: str | None = None
+
+    expected_interval_seconds: int | None = None
+    grace_period_seconds: int | None = None
+    last_heartbeat_at: datetime | None = None
+    next_expected_at: datetime | None = None
+    deadline_at: datetime | None = None
+    heartbeat_token: str | None = None
 
     @computed_field
     @property
@@ -207,3 +234,23 @@ class SSLCheckItemResponse(BaseModel):
 class SSLCheckHistoryResponse(BaseModel):
     items: list[SSLCheckItemResponse]
     count: int
+
+
+class HeartbeatEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    monitor_id: int
+    received_at: datetime
+    event_type: str
+    ip_address: str | None = None
+
+
+class HeartbeatEventsListResponse(BaseModel):
+    items: list[HeartbeatEventResponse]
+    count: int
+
+
+class HeartbeatRegenerateResponse(BaseModel):
+    heartbeat_token: str
+    message: str

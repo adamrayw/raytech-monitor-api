@@ -12,6 +12,7 @@ from app.routes.monitors import router as monitors_router
 from app.routes.incidents import router as incidents_router
 from app.routes.notifications import router as notifications_router
 from app.routes.auth import router as auth_router
+from app.routes.heartbeat import router as heartbeat_router
 
 app = FastAPI(
     title="Raytech Monitor API",
@@ -59,6 +60,16 @@ def startup():
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_valid_from TIMESTAMP WITH TIME ZONE;"))
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_error_type VARCHAR(64);"))
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_error_message TEXT;"))
+            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS expected_interval_seconds INTEGER;"))
+            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS grace_period_seconds INTEGER;"))
+            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMP WITH TIME ZONE;"))
+            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS next_expected_at TIMESTAMP WITH TIME ZONE;"))
+            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMP WITH TIME ZONE;"))
+            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS heartbeat_token_hash VARCHAR(64);"))
+            try:
+                conn.execute(text("ALTER TABLE monitors ALTER COLUMN url DROP NOT NULL;"))
+            except Exception:
+                pass
             conn.commit()
     except Exception:
         pass
@@ -68,6 +79,7 @@ app.include_router(monitors_router)
 app.include_router(incidents_router)
 app.include_router(notifications_router)
 app.include_router(auth_router)
+app.include_router(heartbeat_router)
 
 @app.get("/")
 def root():

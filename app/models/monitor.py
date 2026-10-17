@@ -40,9 +40,9 @@ class Monitor(Base):
         nullable=False,
     )
 
-    url: Mapped[str] = mapped_column(
+    url: Mapped[str | None] = mapped_column(
         String(2048),
-        nullable=False,
+        nullable=True,
     )
 
     interval_seconds: Mapped[int] = mapped_column(
@@ -208,6 +208,39 @@ class Monitor(Base):
         nullable=True,
     )
 
+    expected_interval_seconds: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    grace_period_seconds: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    next_expected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+        nullable=True,
+    )
+
+    heartbeat_token_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
@@ -246,6 +279,12 @@ class Monitor(Base):
 
     ssl_notifications = relationship(
         "SSLNotificationLog",
+        back_populates="monitor",
+        cascade="all, delete-orphan",
+    )
+
+    heartbeat_events = relationship(
+        "HeartbeatEvent",
         back_populates="monitor",
         cascade="all, delete-orphan",
     )

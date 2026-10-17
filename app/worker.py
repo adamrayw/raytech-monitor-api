@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from app.services.monitor_runner import run_due_monitors
 from app.services.ssl_service import run_due_ssl_checks
+from app.services.heartbeat_service import run_due_heartbeat_checks
 
 
 POLL_INTERVAL_SECONDS = 10
@@ -71,6 +72,21 @@ async def worker_loop():
                             "event": "ssl_cycle",
                             "timestamp": utcnow_iso(),
                             **ssl_result,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    flush=True,
+                )
+
+            heartbeat_result = await run_due_heartbeat_checks()
+            if heartbeat_result.get("due", 0) > 0:
+                print(
+                    json.dumps(
+                        {
+                            "event": "heartbeat_cycle",
+                            "timestamp": utcnow_iso(),
+                            **heartbeat_result,
                         },
                         ensure_ascii=False,
                         default=str,
