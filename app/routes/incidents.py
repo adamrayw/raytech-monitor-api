@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -38,22 +38,26 @@ def serialize_incident(
 
 @router.get("")
 def list_incidents(
-    limit: int = 50,
+    monitor_id: int | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    limit = max(1, min(limit, 100))
-
-    rows = db.execute(
+    query = (
         select(Incident, Monitor)
         .join(
             Monitor,
             Monitor.id == Incident.monitor_id,
         )
         .where(Monitor.user_id == user.id)
-        .order_by(Incident.started_at.desc())
-        .limit(limit)
-    ).all()
+    )
+
+    if monitor_id is not None:
+        query = query.where(Incident.monitor_id == monitor_id)
+
+    query = query.order_by(Incident.started_at.desc()).limit(limit)
+
+    rows = db.execute(query).all()
 
     items = [
         serialize_incident(incident, monitor)

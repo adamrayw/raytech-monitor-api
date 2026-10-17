@@ -83,3 +83,49 @@ class MonitorResponse(BaseModel):
 class MonitorListResponse(BaseModel):
     items: list[MonitorResponse]
     count: int
+
+
+class MonitorMetricPoint(BaseModel):
+    timestamp: datetime
+    avg_response_ms: float | None
+    success_rate_percent: float | None
+    checks: int
+
+
+class MonitorMetricsResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    monitor_id: int
+    range: str
+    from_: datetime = Field(alias="from", serialization_alias="from")
+    to: datetime
+
+    total_checks: int
+    successful_checks: int
+    failed_checks: int
+
+    uptime_percent: float | None
+
+    avg_response_ms: float | None
+    p95_response_ms: float | None
+    min_response_ms: float | None
+    max_response_ms: float | None
+
+    points: list[MonitorMetricPoint]
+
+
+class MonitorCheckResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    checked_at: datetime
+    success: bool
+    http_status: int | None
+    response_ms: float | None
+    error_type: str | None
+    error_message: str | None
+
+
+class MonitorCheckListResponse(BaseModel):
+    items: list[MonitorCheckResponse]
+    count: int

@@ -5,6 +5,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -20,6 +21,10 @@ def utcnow():
 
 class MonitorCheck(Base):
     __tablename__ = "monitor_checks"
+
+    __table_args__ = (
+        Index("ix_monitor_checks_monitor_id_checked_at", "monitor_id", "checked_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
