@@ -236,11 +236,11 @@ def get_monitor_checks(
 @router.get("/{monitor_id}/metrics", response_model=MonitorMetricsResponse)
 def get_monitor_metrics(
     monitor_id: int,
-    range: str = Query(default="24h"),
+    metric_range: str = Query(default="24h", alias="range"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if range not in ("24h", "7d"):
+    if metric_range not in ("24h", "7d"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Supported range values are '24h' and '7d'",
@@ -249,7 +249,7 @@ def get_monitor_metrics(
     get_owned_monitor(monitor_id, user, db)
 
     to_time = utcnow()
-    if range == "24h":
+    if metric_range == "24h":
         from_time = to_time - timedelta(hours=24)
         bucket_seconds = 15 * 60  # 15 minutes
     else:
@@ -322,7 +322,7 @@ def get_monitor_metrics(
 
     return {
         "monitor_id": monitor_id,
-        "range": range,
+        "range": metric_range,
         "from": from_time,
         "to": to_time,
         "total_checks": total_checks,
