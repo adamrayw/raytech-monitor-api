@@ -70,3 +70,9 @@ class User(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+
+    payment_transactions = relationship(
+        "PaymentTransaction",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )

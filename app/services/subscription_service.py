@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -75,10 +75,11 @@ PLAN_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
-def get_or_create_subscription(db: Session, user_id: int) -> UserSubscription:
-    """Transactionally safe retrieval or creation of user subscription.
+def get_or_create_subscription(db: Session, user_id: int, commit: bool = True) -> UserSubscription:
+    """Retrieves existing user subscription or initializes default Free tier.
 
     Always falls back to Free plan if none exists or on initial onboarding.
+    When commit=False, flushes changes without committing so outer transaction retains atomicity.
     """
     sub = db.scalar(
         select(UserSubscription).where(UserSubscription.user_id == user_id)
@@ -95,6 +96,11 @@ def get_or_create_subscription(db: Session, user_id: int) -> UserSubscription:
         cancel_at_period_end=False,
         legacy_override=False,
     )
+    if not commit:
+        db.add(new_sub)
+        db.flush()
+        return new_sub
+
     try:
         db.add(new_sub)
         db.commit()
@@ -120,9 +126,28 @@ def get_effective_plan(db: Session, user_id: int) -> tuple[str, UserSubscription
     """Returns effective plan id ('free' or 'pro') and subscription record.
 
     Never interprets missing or error state as Pro.
+    Automatically checks and enforces expiration on paid Pro subscriptions.
     """
     try:
         sub = get_or_create_subscription(db, user_id)
+
+        # Evaluate automatic expiration for paid Pro (without grandfathered legacy_override)
+        if sub.plan == "pro" and not getattr(sub, "legacy_override", False):
+            if sub.current_period_end is not None:
+                now = utcnow()
+                end_time = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
+                if now > end_time:
+                    logger.info(f"User {user_id} Pro subscription expired at {sub.current_period_end}. Downgrading to Free.")
+                    sub.plan = "free"
+                    sub.status = "expired"
+                    sub.updated_at = now
+                    try:
+                        db.commit()
+                        db.refresh(sub)
+                    except Exception as e:
+                        db.rollback()
+                        logger.warning(f"Failed to persist expired status for user {user_id}: {e}")
+
         plan_id = sub.plan.lower() if sub.plan else "free"
         if plan_id not in PLAN_CONFIG:
             plan_id = "free"
@@ -428,3 +453,56 @@ def switch_user_plan_dev(
     db.refresh(sub)
     logger.info(f"User {user_id} subscription plan changed to '{plan_clean}' (legacy_override={legacy_override}, reason: {reason})")
     return sub
+
+
+def activate_pro_from_payment(
+    db: Session,
+    user_id: int,
+    transaction_id: int,
+    duration_days: int = 30,
+    commit: bool = True,
+) -> UserSubscription:
+    """Activates or extends 30 days of Pro entitlements after a verified payment.
+
+    If user already has an active paid Pro subscription, extends from existing end date.
+    When commit=False, caller owns the database transaction and flushes changes without committing.
+    """
+    sub = get_or_create_subscription(db, user_id, commit=commit)
+    now = utcnow()
+
+    if getattr(sub, "legacy_override", False):
+        # Account has grandfathered legacy Pro; preserve legacy_override while recording paid period
+        sub.plan = "pro"
+        sub.status = "active"
+        sub.current_period_start = now
+        sub.current_period_end = now + timedelta(days=duration_days)
+        sub.override_reason = f"xendit_payment:{transaction_id} (legacy grandfathered)"
+    elif (
+        sub.plan == "pro"
+        and sub.current_period_end is not None
+    ):
+        # Active paid Pro; extend end date
+        end_tz = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
+        base_time = max(end_tz, now)
+        sub.current_period_end = base_time + timedelta(days=duration_days)
+        sub.override_reason = f"xendit_payment:{transaction_id}"
+    else:
+        # Free tier or manual Pro without an expiration date; establish new paid period
+        sub.plan = "pro"
+        sub.status = "active"
+        sub.current_period_start = now
+        sub.current_period_end = now + timedelta(days=duration_days)
+        sub.override_reason = f"xendit_payment:{transaction_id}"
+
+    sub.cancel_at_period_end = False
+    sub.updated_at = now
+
+    if commit:
+        db.commit()
+        db.refresh(sub)
+    else:
+        db.flush()
+
+    logger.info(f"User {user_id} activated Pro subscription until {sub.current_period_end} via tx {transaction_id} (commit={commit})")
+    return sub
+

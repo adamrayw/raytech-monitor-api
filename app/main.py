@@ -17,6 +17,8 @@ from app.routes.settings import router as settings_router
 from app.routes.status_pages import router as status_pages_router
 from app.routes.public_status import router as public_status_router
 from app.routes.subscription import router as subscription_router
+from app.routes.billing import router as billing_router
+from app.routes.webhooks import router as webhooks_router
 
 app = FastAPI(
     title="Raytech Monitor API",
@@ -91,6 +93,28 @@ def startup():
             """))
             conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS legacy_override BOOLEAN NOT NULL DEFAULT FALSE;"))
             conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS override_reason VARCHAR(128);"))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS payment_transactions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    subscription_id INTEGER REFERENCES user_subscriptions(id) ON DELETE SET NULL,
+                    provider VARCHAR(32) NOT NULL DEFAULT 'xendit',
+                    provider_payment_id VARCHAR(128),
+                    provider_session_id VARCHAR(128),
+                    external_id VARCHAR(128) UNIQUE NOT NULL,
+                    plan VARCHAR(32) NOT NULL DEFAULT 'pro',
+                    amount INTEGER NOT NULL DEFAULT 49000,
+                    currency VARCHAR(8) NOT NULL DEFAULT 'IDR',
+                    status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+                    payment_method VARCHAR(64),
+                    payment_channel VARCHAR(64),
+                    checkout_url VARCHAR(512),
+                    expires_at TIMESTAMP WITH TIME ZONE,
+                    paid_at TIMESTAMP WITH TIME ZONE,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
             try:
                 conn.execute(text("ALTER TABLE monitors ALTER COLUMN url DROP NOT NULL;"))
             except Exception:
@@ -98,6 +122,12 @@ def startup():
             conn.commit()
     except Exception:
         pass
+
+    try:
+        from app.services.xendit_service import validate_xendit_environment
+        validate_xendit_environment()
+    except Exception as exc:
+        logger.warning(f"Xendit environment check: {exc}")
 
 
 app.include_router(monitors_router)
@@ -109,6 +139,8 @@ app.include_router(settings_router)
 app.include_router(status_pages_router)
 app.include_router(public_status_router)
 app.include_router(subscription_router)
+app.include_router(billing_router)
+app.include_router(webhooks_router)
 
 @app.get("/")
 def root():

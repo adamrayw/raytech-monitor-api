@@ -45,11 +45,48 @@ def get_user_subscription(
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Returns effective plan, subscription status, entitlements, and billing summary."""
+    from sqlalchemy import func, select
+    from app.models.payment_transaction import PaymentTransaction
+
     sub = get_or_create_subscription(db, current_user.id)
     entitlements = get_entitlements(db, current_user.id)
     plan_id = entitlements["id"]
 
     is_pro = plan_id == "pro"
+
+    # Query real paid transactions
+    tx_count = (
+        db.scalar(
+            select(func.count(PaymentTransaction.id)).where(
+                PaymentTransaction.user_id == current_user.id,
+                PaymentTransaction.status == "PAID",
+            )
+        )
+        or 0
+    )
+
+    latest_paid_tx = db.scalar(
+        select(PaymentTransaction)
+        .where(
+            PaymentTransaction.user_id == current_user.id,
+            PaymentTransaction.status == "PAID",
+        )
+        .order_by(PaymentTransaction.paid_at.desc())
+        .limit(1)
+    )
+
+    if is_pro:
+        if latest_paid_tx:
+            channel_info = f" ({latest_paid_tx.payment_channel})" if latest_paid_tx.payment_channel else ""
+            payment_method = f"Xendit{channel_info}"
+        elif getattr(sub, "legacy_override", False):
+            payment_method = "Legacy Grandfathered"
+        else:
+            payment_method = "Not configured"
+        billing_cycle = "30-day Prepaid"
+    else:
+        payment_method = "Not required"
+        billing_cycle = "N/A"
 
     return {
         "plan": plan_id,
@@ -64,10 +101,10 @@ def get_user_subscription(
         "cancel_at_period_end": sub.cancel_at_period_end,
         "legacy_override": sub.legacy_override,
         "upgrade_available": not is_pro,
-        "payment_method": "Not configured" if is_pro else "Not required",
-        "billing_cycle": "Monthly" if is_pro else "Not applicable",
+        "payment_method": payment_method,
+        "billing_cycle": billing_cycle,
         "renewal_date": sub.current_period_end.isoformat() if (is_pro and sub.current_period_end) else None,
-        "invoices_count": 0,
+        "invoices_count": tx_count,
         "entitlements": {
             "max_http_monitors": entitlements["max_http_monitors"],
             "min_http_interval_seconds": entitlements["min_http_interval_seconds"],

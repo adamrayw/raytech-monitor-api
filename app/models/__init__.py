@@ -10,6 +10,7 @@ from app.models.notification_preference import NotificationPreference
 from app.models.email_delivery import EmailDelivery
 from app.models.status_page import StatusPage, StatusPageMonitor
 from app.models.subscription import UserSubscription
+from app.models.payment_transaction import PaymentTransaction
 
 __all__ = [
     "User",
@@ -25,5 +26,6 @@ __all__ = [
     "StatusPage",
     "StatusPageMonitor",
     "UserSubscription",
+    "PaymentTransaction",
 ]
 
