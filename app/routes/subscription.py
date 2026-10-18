@@ -30,12 +30,17 @@ class SwitchPlanRequest(BaseModel):
 def is_dev_switching_allowed() -> bool:
     """Checks whether development plan switching is permitted.
 
-    Strictly disabled in production.
+    Strictly disabled in production and defaults to closed.
     """
-    env = os.environ.get("ENVIRONMENT", "development").lower()
-    allow_flag = os.environ.get("ALLOW_DEV_PLAN_SWITCH", "true").lower()
+    env = os.environ.get("ENVIRONMENT", "").strip().lower()
     if env in ("production", "prod"):
         return False
+    is_test_env = bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("TESTING", "").lower() in ("true", "1")
+    )
+    default_flag = "true" if is_test_env else "false"
+    allow_flag = os.environ.get("ALLOW_DEV_PLAN_SWITCH", default_flag).lower()
     return allow_flag in ("1", "true", "yes")
 
 

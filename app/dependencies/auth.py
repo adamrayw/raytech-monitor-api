@@ -29,8 +29,10 @@ def get_current_user(
         if user is not None and user.is_active:
             return user
 
+    is_production = os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod")
     if (
-        DEV_TOKEN
+        not is_production
+        and DEV_TOKEN
         and DEV_USER_EMAIL
         and x_dev_token
         and secrets.compare_digest(

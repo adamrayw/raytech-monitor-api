@@ -76,7 +76,7 @@ PLAN_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
-def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+def ensure_utc(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo is None:

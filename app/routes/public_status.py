@@ -51,11 +51,23 @@ def get_published_status_page_or_404(db: Session, slug: str) -> StatusPage:
     return page
 
 
+from app.services.rate_limiter import api_rate_limiter, get_trusted_client_ip
+from fastapi import Request
+
+
 @router.get("/{slug}", response_model=PublicStatusPageResponse)
 def get_public_status_page(
     slug: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    client_ip = get_trusted_client_ip(request)
+    api_rate_limiter.check_or_raise(
+        f"public_status:{client_ip}",
+        max_requests=60,
+        window_seconds=60.0,
+        error_detail="Too many requests for public status page. Please slow down.",
+    )
     page = get_published_status_page_or_404(db, slug)
 
     page_monitors = (

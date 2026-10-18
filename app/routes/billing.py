@@ -49,6 +49,9 @@ def parse_iso_datetime(dt_str: str | None) -> datetime | None:
         return None
 
 
+from app.services.rate_limiter import api_rate_limiter
+
+
 @router.post("/checkout", summary="Create Xendit hosted checkout session")
 def create_checkout_session(
     payload: CheckoutRequest,
@@ -60,6 +63,12 @@ def create_checkout_session(
     Price and duration are authoritative on the backend (IDR 49,000 for 30 days).
     Client cannot supply custom amounts or duration.
     """
+    api_rate_limiter.check_or_raise(
+        f"billing_checkout:{current_user.id}",
+        max_requests=10,
+        window_seconds=60.0,
+        error_detail="Too many checkout attempts. Please wait a minute before creating another checkout.",
+    )
     requested_plan = payload.plan.strip().lower()
     if requested_plan != PRO_PLAN_ID:
         raise HTTPException(
@@ -256,6 +265,12 @@ def get_transaction_status(
     If status is PENDING and Xendit credentials exist, performs an authoritative
     sync check with Xendit in case the webhook was delayed.
     """
+    api_rate_limiter.check_or_raise(
+        f"billing_poll:{current_user.id}",
+        max_requests=60,
+        window_seconds=60.0,
+        error_detail="Too many status polling requests. Please wait before polling again.",
+    )
     tx = db.scalar(
         select(PaymentTransaction).where(
             PaymentTransaction.id == transaction_id,

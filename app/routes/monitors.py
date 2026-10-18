@@ -109,16 +109,27 @@ def list_monitors(
     }
 
 
+from app.services.rate_limiter import api_rate_limiter
+from app.services.http_checker import UnsafeTargetError, validate_target
+
+
 @router.post(
     "",
     response_model=MonitorResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_monitor(
+async def create_monitor(
     payload: MonitorCreate,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    api_rate_limiter.check_or_raise(
+        f"monitor_write:{user.id}",
+        max_requests=30,
+        window_seconds=60.0,
+        error_detail="Too many monitor modifications. Please wait a moment before trying again.",
+    )
+
     if payload.type == "heartbeat":
         enforce_monitor_creation_quota(db, user.id, "heartbeat")
         raw_token, token_hash = generate_heartbeat_token()
@@ -152,6 +163,14 @@ def create_monitor(
     enforce_http_interval(db, user.id, payload.interval_seconds)
 
     url_str = str(payload.url)
+    try:
+        await validate_target(url_str)
+    except UnsafeTargetError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid target URL: {exc}",
+        )
+
     ssl_enabled = payload.ssl_monitoring_enabled
     if ssl_enabled:
         enforce_ssl_access(db, user.id)
@@ -197,12 +216,19 @@ def get_monitor(
 
 
 @router.patch("/{monitor_id}", response_model=MonitorResponse)
-def update_monitor(
+async def update_monitor(
     monitor_id: int,
     payload: MonitorUpdate,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    api_rate_limiter.check_or_raise(
+        f"monitor_write:{user.id}",
+        max_requests=30,
+        window_seconds=60.0,
+        error_detail="Too many monitor modifications. Please wait a moment before trying again.",
+    )
+
     monitor = get_owned_monitor(monitor_id, user, db)
 
     updates = payload.model_dump(exclude_unset=True)
@@ -231,6 +257,15 @@ def update_monitor(
         enforce_ssl_access(db, user.id, existing_monitor=monitor)
 
     new_url = updates.get("url")
+    if new_url is not None:
+        try:
+            await validate_target(str(new_url))
+        except UnsafeTargetError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid target URL: {exc}",
+            )
+
     effective_url = str(new_url) if new_url is not None else monitor.url
     effective_ssl = updates.get("ssl_monitoring_enabled", monitor.ssl_monitoring_enabled)
 

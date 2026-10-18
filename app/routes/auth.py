@@ -25,8 +25,18 @@ GOOGLE_REDIRECT_URI = os.environ.get(
     "https://api.monitor.raytech.cloud/auth/google/callback",
 )
 
+from app.services.rate_limiter import api_rate_limiter, get_trusted_client_ip
+
+
 @router.get("/google/login")
 async def google_login(request: Request):
+    client_ip = get_trusted_client_ip(request)
+    api_rate_limiter.check_or_raise(
+        f"auth_login:{client_ip}",
+        max_requests=30,
+        window_seconds=60.0,
+        error_detail="Too many login attempts. Please wait a minute before retrying.",
+    )
     return await oauth.google.authorize_redirect(
         request,
         GOOGLE_REDIRECT_URI,
@@ -89,6 +99,8 @@ async def google_callback(
     db.commit()
     db.refresh(user)
 
+    # Session fixation defense: regenerate/clear prior anonymous session state before setting user id
+    request.session.clear()
     request.session["user_id"] = user.id
 
     return RedirectResponse(

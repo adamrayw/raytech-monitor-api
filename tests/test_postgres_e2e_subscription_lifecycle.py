@@ -5,7 +5,7 @@ and Real PostgreSQL Concurrency & Row-Level Locking against an isolated test dat
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Generator
+from typing import Any, Generator
 from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient

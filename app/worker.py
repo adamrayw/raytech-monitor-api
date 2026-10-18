@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import signal
 import time
 from datetime import datetime, timezone
@@ -175,6 +176,14 @@ async def worker_loop():
                 ),
                 flush=True,
             )
+
+        # Record liveness heartbeat for container progress probes
+        try:
+            heartbeat_path = os.environ.get("WORKER_HEARTBEAT_FILE", "/tmp/raytech_worker_heartbeat")
+            with open(heartbeat_path, "w") as hf:
+                hf.write(utcnow_iso())
+        except Exception:
+            pass
 
         try:
             await asyncio.wait_for(
