@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -75,6 +75,7 @@ def resolve_incident(
     db: Session,
     monitor: Monitor,
     checked_at: datetime,
+    reason: str = "successful_check",
 ) -> Incident | None:
     incident = get_open_incident(db, monitor.id)
 
@@ -83,8 +84,16 @@ def resolve_incident(
 
     incident.status = "resolved"
     incident.resolved_at = checked_at
+    incident.resolution_reason = reason
 
-    duration = checked_at - incident.started_at
+    started_at = incident.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    check_dt = checked_at
+    if check_dt.tzinfo is None:
+        check_dt = check_dt.replace(tzinfo=timezone.utc)
+
+    duration = check_dt - started_at
     incident.duration_seconds = max(
         0,
         int(duration.total_seconds()),
@@ -104,39 +113,50 @@ def handle_incident_transition(
 
     event = None
     incident = None
+    open_inc = get_open_incident(db, monitor.id)
 
-    if previous_status != "down" and current_status == "down":
-        incident = open_incident(
-            db=db,
-            monitor=monitor,
-            result=result,
-            checked_at=checked_at,
-        )
+    if current_status == "down":
+        if open_inc is None:
+            incident = open_incident(
+                db=db,
+                monitor=monitor,
+                result=result,
+                checked_at=checked_at,
+            )
+            event = "opened"
+        else:
+            incident = update_open_incident(
+                db=db,
+                monitor=monitor,
+                result=result,
+            )
 
-        event = "opened"
-
-    elif previous_status == "down" and current_status == "down":
-        incident = update_open_incident(
-            db=db,
-            monitor=monitor,
-            result=result,
-        )
-
-    elif (
-        previous_status == "down"
-        and current_status in {"operational", "degraded"}
-    ):
-        incident = resolve_incident(
-            db=db,
-            monitor=monitor,
-            checked_at=checked_at,
-        )
-
-        if incident is not None:
-            event = "resolved"
+    elif current_status in {"operational", "degraded"}:
+        if open_inc is not None:
+            # Service is healthy/operational: any active open incident MUST be resolved.
+            # Normal recovery generates an event only if recovering from down or newly resumed.
+            # If previous status was already operational or degraded, this was a stale/orphaned incident
+            # and is resolved silently without sending false recovery notifications/emails.
+            if previous_status in {"down", "unknown"}:
+                incident = resolve_incident(
+                    db=db,
+                    monitor=monitor,
+                    checked_at=checked_at,
+                    reason="successful_check",
+                )
+                if incident is not None:
+                    event = "resolved"
+            else:
+                incident = resolve_incident(
+                    db=db,
+                    monitor=monitor,
+                    checked_at=checked_at,
+                    reason="reconciled_stale_incident",
+                )
+                event = None
 
     # Important:
-    # make sure a newly created incident already has an ID
+    # make sure a newly created/updated incident already has an ID
     # before we return its transition metadata.
     if incident is not None:
         db.flush()

@@ -258,16 +258,8 @@ def update_monitor(
     if "is_active" in updates:
         if monitor.type == "heartbeat":
             if monitor.is_active and not previous_active:
-                # Resumed: resolve any open incident, reset to pending until fresh heartbeat
-                open_inc = db.scalar(
-                    select(Incident).where(
-                        Incident.monitor_id == monitor.id,
-                        Incident.status == "open",
-                    )
-                )
-                if open_inc:
-                    open_inc.status = "resolved"
-                    open_inc.resolved_at = utcnow()
+                # Resumed: reset to pending until fresh heartbeat arrives
+                # Do NOT assume healthy before fresh heartbeat proves recovery
                 monitor.status = "pending"
                 monitor.next_expected_at = None
                 monitor.deadline_at = None
@@ -293,7 +285,7 @@ def update_monitor(
                     monitor.ssl_status = "paused"
                     monitor.ssl_next_check_at = None
 
-    elif monitor.type == "heartbeat":
+    if monitor.type == "heartbeat":
         if ("expected_interval_seconds" in updates or "grace_period_seconds" in updates) and monitor.last_heartbeat_at:
             last_hb = monitor.last_heartbeat_at
             if last_hb.tzinfo is None:
@@ -303,7 +295,25 @@ def update_monitor(
             monitor.next_expected_at = last_hb + timedelta(seconds=interval)
             monitor.deadline_at = monitor.next_expected_at + timedelta(seconds=grace)
 
-    elif monitor.is_active and reset_state:
+    if monitor.is_active and reset_state:
+        # Administrative closure for active incident when target configuration changes
+        # Does NOT emit false recovery notification/email
+        open_inc = db.scalar(
+            select(Incident).where(
+                Incident.monitor_id == monitor.id,
+                Incident.status == "open",
+            )
+        )
+        if open_inc:
+            now = utcnow()
+            open_inc.status = "resolved"
+            open_inc.resolved_at = now
+            open_inc.resolution_reason = "configuration_changed"
+            started_at = open_inc.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            open_inc.duration_seconds = max(0, int((now - started_at).total_seconds()))
+
         monitor.status = "unknown"
         monitor.consecutive_failures = 0
         monitor.consecutive_successes = 0

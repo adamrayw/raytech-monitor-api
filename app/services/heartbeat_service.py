@@ -93,26 +93,28 @@ def process_heartbeat(
 
     event_type = "ping"
 
-    # If previously missed, resolve incident and emit recovery notification
-    if previous_status == "missed":
-        event_type = "recovery"
-        open_incident = db.scalar(
-            select(Incident)
-            .where(
-                Incident.monitor_id == monitor.id,
-                Incident.status == "open",
-            )
-            .order_by(Incident.started_at.desc())
+    # If an open incident exists, resolve it since service is now confirmed healthy
+    open_incident = db.scalar(
+        select(Incident)
+        .where(
+            Incident.monitor_id == monitor.id,
+            Incident.status == "open",
         )
-        if open_incident:
-            open_incident.status = "resolved"
-            open_incident.resolved_at = now
-            if open_incident.started_at:
-                start_dt = open_incident.started_at
-                if start_dt.tzinfo is None:
-                    start_dt = start_dt.replace(tzinfo=timezone.utc)
-                duration = int((now - start_dt).total_seconds())
-                open_incident.duration_seconds = max(0, duration)
+        .order_by(Incident.started_at.desc())
+    )
+    if open_incident:
+        open_incident.status = "resolved"
+        open_incident.resolved_at = now
+        if open_incident.started_at:
+            start_dt = open_incident.started_at
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            duration = int((now - start_dt).total_seconds())
+            open_incident.duration_seconds = max(0, duration)
+
+        if previous_status == "missed":
+            event_type = "recovery"
+            open_incident.resolution_reason = "heartbeat_received"
 
             # Check if recovery notification already exists for this incident
             existing_notif = db.scalar(
@@ -138,6 +140,8 @@ def process_heartbeat(
                     enqueue_email_for_notification(db, recovery_notif)
                 except Exception:
                     pass
+        else:
+            open_incident.resolution_reason = "reconciled_stale_incident"
 
     event = HeartbeatEvent(
         monitor_id=monitor.id,

@@ -31,6 +31,7 @@ def serialize_incident(
         "started_at": incident.started_at,
         "resolved_at": incident.resolved_at,
         "duration_seconds": incident.duration_seconds,
+        "resolution_reason": getattr(incident, "resolution_reason", None),
         "created_at": incident.created_at,
         "updated_at": incident.updated_at,
     }

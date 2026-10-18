@@ -112,15 +112,18 @@ def calculate_overall_status(public_statuses: list[str]) -> tuple[str, str]:
     if any(s == "degraded" for s in public_statuses):
         return "degraded", "Degraded Performance"
 
-    if all(s == "maintenance" for s in public_statuses):
-        return "maintenance", "Scheduled Maintenance in Progress"
-
-    if all(s == "unknown" for s in public_statuses):
+    has_operational = any(s == "operational" for s in public_statuses)
+    if not has_operational:
+        if any(s == "maintenance" for s in public_statuses):
+            return "maintenance", "Scheduled Maintenance in Progress"
         return "unknown", "Service Status Pending"
 
-    # If some are maintenance and the rest operational
+    # There is at least one operational service and no down/degraded services
     if any(s == "maintenance" for s in public_statuses):
         return "operational", "Systems Operational (Some in Maintenance)"
+
+    if any(s == "unknown" for s in public_statuses):
+        return "operational", "Systems Operational (Some Status Pending)"
 
     return "operational", "All Systems Operational"
 

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -180,13 +180,16 @@ def get_public_status_incidents(
         if mon:
             monitor_names[mon.id] = spm.display_name or mon.name
 
-    # Query incidents in the past 30 days for these monitors
+    # Query incidents in the past 30 days or any currently open incident for these monitors
     thirty_days_ago = utcnow() - timedelta(days=30)
     incidents = db.scalars(
         select(Incident)
         .where(
             Incident.monitor_id.in_(monitor_ids),
-            Incident.started_at >= thirty_days_ago,
+            or_(
+                Incident.status == "open",
+                Incident.started_at >= thirty_days_ago,
+            ),
         )
         .order_by(Incident.started_at.desc())
         .limit(limit)

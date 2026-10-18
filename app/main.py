@@ -71,6 +71,7 @@ def startup():
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS next_expected_at TIMESTAMP WITH TIME ZONE;"))
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMP WITH TIME ZONE;"))
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS heartbeat_token_hash VARCHAR(64);"))
+            conn.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution_reason VARCHAR(64);"))
             try:
                 conn.execute(text("ALTER TABLE monitors ALTER COLUMN url DROP NOT NULL;"))
             except Exception:
