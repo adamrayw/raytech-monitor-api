@@ -105,6 +105,10 @@ def get_user_subscription(
     end_wib = format_wib_datetime(sub.current_period_end) if sub.current_period_end else None
     is_expired_pro = (sub.status == "expired") or (not is_pro and tx_count > 0)
 
+    from app.services.xendit_service import is_user_allowed_sandbox_checkout
+
+    sandbox_checkout_allowed = is_user_allowed_sandbox_checkout(current_user)
+
     billing_summary = {
         "plan_id": plan_id,
         "plan_name": entitlements["name"],
@@ -115,6 +119,8 @@ def get_user_subscription(
         "renewal_date": sub.current_period_end.isoformat() if (is_pro and sub.current_period_end) else None,
         "invoices_count": tx_count,
         "auto_renew": False,
+        "checkout_allowed": sandbox_checkout_allowed,
+        "checkout_mode": "sandbox",
     }
 
     return {
@@ -134,6 +140,7 @@ def get_user_subscription(
         "cancel_at_period_end": sub.cancel_at_period_end,
         "legacy_override": sub.legacy_override,
         "upgrade_available": not is_pro,
+        "sandbox_checkout_allowed": sandbox_checkout_allowed,
         "payment_method": payment_method,
         "billing_cycle": billing_cycle,
         "renewal_date": sub.current_period_end.isoformat() if (is_pro and sub.current_period_end) else None,

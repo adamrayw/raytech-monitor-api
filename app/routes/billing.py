@@ -28,6 +28,7 @@ from app.services.xendit_service import (
     get_frontend_url,
     get_xendit_invoice,
     get_xendit_secret_key,
+    is_user_allowed_sandbox_checkout,
 )
 
 logger = logging.getLogger("raytech.billing")
@@ -76,6 +77,23 @@ def create_checkout_session(
             detail={
                 "code": "INVALID_PLAN",
                 "message": f"Only '{PRO_PLAN_ID}' plan is available for checkout.",
+            },
+        )
+
+    # Controlled Sandbox Checkout Protection:
+    if not is_user_allowed_sandbox_checkout(current_user):
+        logger.warning(
+            f"Blocked sandbox checkout attempt for non-allowlisted user {current_user.id} ({current_user.email})"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "SANDBOX_CHECKOUT_RESTRICTED",
+                "message": (
+                    "Pembelian paket Pro saat ini beroperasi dalam mode Sandbox tertutup (internal testing) "
+                    "dan belum dibuka untuk umum. Hubungi tim dukungan di alerts@raytech.cloud untuk "
+                    "permohonan akses pengujian."
+                ),
             },
         )
 

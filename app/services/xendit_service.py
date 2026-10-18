@@ -45,6 +45,41 @@ def get_xendit_mode() -> str:
     return "test"
 
 
+def is_user_allowed_sandbox_checkout(user: Any) -> bool:
+    """Evaluates whether an authenticated user is permitted to initiate Sandbox checkout.
+
+    In test/sandbox mode, ordinary public users must not initiate sandbox transactions or
+    mistake them for real purchases. Only allowlisted test accounts are permitted.
+
+    Allowlist sources (checked in order):
+    1. SANDBOX_CHECKOUT_ALLOWLIST environment variable (comma-separated list of emails, user IDs, or domains e.g. '@raytech.cloud'). If set to '*' or 'all', all authenticated users are permitted (used in full-matrix test suites).
+    2. Default fallback if SANDBOX_CHECKOUT_ALLOWLIST is not configured: Internal Raytech team accounts ending with '@raytech.cloud'.
+    """
+    if not user:
+        return False
+    user_email = (getattr(user, "email", "") or "").strip().lower()
+    user_id = getattr(user, "id", None)
+
+    raw_allowlist = os.environ.get("SANDBOX_CHECKOUT_ALLOWLIST", "").strip()
+
+    if raw_allowlist in ("*", "all"):
+        return True
+
+    if raw_allowlist:
+        entries = [e.strip().lower() for e in raw_allowlist.split(",") if e.strip()]
+        for entry in entries:
+            if entry in ("*", "all") or entry == user_email or (user_id is not None and entry == str(user_id)):
+                return True
+            if entry.startswith("@") and user_email.endswith(entry):
+                return True
+            if entry.startswith("*@") and user_email.endswith(entry[1:]):
+                return True
+        return False
+
+    # Default fallback: allow internal @raytech.cloud accounts
+    return bool(user_email and user_email.endswith("@raytech.cloud"))
+
+
 def get_xendit_secret_key() -> str:
     """Retrieves and validates Xendit secret key against the enforced Sandbox environment."""
     # Ensure mode is test

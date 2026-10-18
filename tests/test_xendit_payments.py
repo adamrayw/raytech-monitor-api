@@ -899,3 +899,75 @@ def test_get_single_transaction_forbidden_for_other_user(db, non_legacy_free_use
 
     res = buyer_client.get(f"/billing/transactions/{tx_other.id}")
     assert res.status_code == 404
+
+
+# =========================================================================
+# SECTION 8: SANDBOX CHECKOUT PROTECTION & ALLOWLIST TESTS
+# =========================================================================
+
+def test_non_allowlisted_public_user_checkout_strictly_forbidden(db, client):
+    """Ordinary public users outside the allowlist are strictly rejected with HTTP 403."""
+    public_user = User(
+        email="ordinary_customer@gmail.com",
+        name="Public Customer",
+        google_sub="sub-public-customer-999",
+        is_active=True,
+    )
+    db.add(public_user)
+    db.commit()
+
+    from app.dependencies.auth import get_current_user
+    app.dependency_overrides[get_current_user] = lambda: public_user
+
+    try:
+        res = client.post("/billing/checkout", json={"plan": "pro"})
+        assert res.status_code == 403
+        data = res.json()
+        assert data["detail"]["code"] == "SANDBOX_CHECKOUT_RESTRICTED"
+        assert "alerts@raytech.cloud" in data["detail"]["message"]
+
+        # Also verify GET /subscription reflects sandbox restriction
+        sub_res = client.get("/subscription")
+        assert sub_res.status_code == 200
+        sub_data = sub_res.json()
+        assert sub_data["sandbox_checkout_allowed"] is False
+        assert sub_data["billing_summary"]["checkout_allowed"] is False
+    finally:
+        del app.dependency_overrides[get_current_user]
+
+
+def test_custom_allowlist_environment_variable(db, client, monkeypatch):
+    """Custom SANDBOX_CHECKOUT_ALLOWLIST env permits specific email or wildcard."""
+    external_tester = User(
+        email="beta_tester@external-domain.org",
+        name="Beta Tester",
+        google_sub="sub-beta-tester-888",
+        is_active=True,
+    )
+    db.add(external_tester)
+    db.commit()
+
+    from app.dependencies.auth import get_current_user
+    app.dependency_overrides[get_current_user] = lambda: external_tester
+
+    try:
+        # 1. Without allowlist, should be blocked
+        monkeypatch.delenv("SANDBOX_CHECKOUT_ALLOWLIST", raising=False)
+        res_blocked = client.post("/billing/checkout", json={"plan": "pro"})
+        assert res_blocked.status_code == 403
+
+        # 2. With specific email allowlist, should pass
+        monkeypatch.setenv("SANDBOX_CHECKOUT_ALLOWLIST", "beta_tester@external-domain.org,admin@test.com")
+        mock_xendit_resp = {
+            "id": "xnd_inv_beta_123",
+            "invoice_url": "https://checkout-staging.xendit.co/v2/mock_beta",
+            "status": "PENDING",
+            "amount": 49000,
+            "currency": "IDR",
+        }
+        with patch("app.routes.billing.create_xendit_invoice", return_value=mock_xendit_resp):
+            res_allowed = client.post("/billing/checkout", json={"plan": "pro"})
+            assert res_allowed.status_code == 200
+            assert res_allowed.json()["checkout_url"] == "https://checkout-staging.xendit.co/v2/mock_beta"
+    finally:
+        del app.dependency_overrides[get_current_user]
