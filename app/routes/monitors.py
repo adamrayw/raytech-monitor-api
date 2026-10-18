@@ -90,9 +90,22 @@ def list_monitors(
         ).all()
     )
 
+    from app.services.subscription_service import get_eligible_resource_ids
+    eligible_http = get_eligible_resource_ids(db, user.id, "http")
+    eligible_hb = get_eligible_resource_ids(db, user.id, "heartbeat")
+
+    items = []
+    for m in monitors:
+        res = MonitorResponse.model_validate(m)
+        if m.type == "http":
+            res.is_restricted_by_plan = m.id not in eligible_http
+        elif m.type == "heartbeat":
+            res.is_restricted_by_plan = m.id not in eligible_hb
+        items.append(res)
+
     return {
-        "items": monitors,
-        "count": len(monitors),
+        "items": items,
+        "count": len(items),
     }
 
 

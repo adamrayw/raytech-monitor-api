@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.models.monitor import Monitor
 from app.models.status_page import StatusPage
 from app.models.subscription import UserSubscription
+from app.models.subscription_audit import SubscriptionAuditLog
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,47 @@ PLAN_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
+def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def record_subscription_audit_event(
+    db: Session,
+    user_id: int,
+    subscription_id: int,
+    previous_plan: str,
+    new_plan: str,
+    event_type: str,
+    reason: str | None = None,
+    payment_transaction_id: int | None = None,
+    commit: bool = True,
+) -> SubscriptionAuditLog:
+    """Records an auditable subscription lifecycle transition."""
+    audit = SubscriptionAuditLog(
+        user_id=user_id,
+        subscription_id=subscription_id,
+        previous_plan=previous_plan,
+        new_plan=new_plan,
+        event_type=event_type,
+        reason=reason,
+        payment_transaction_id=payment_transaction_id,
+        created_at=utcnow(),
+    )
+    db.add(audit)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    logger.info(
+        f"Subscription audit event recorded: user {user_id}, {event_type} ({previous_plan} -> {new_plan})"
+    )
+    return audit
+
+
 def get_or_create_subscription(db: Session, user_id: int, commit: bool = True) -> UserSubscription:
     """Retrieves existing user subscription or initializes default Free tier.
 
@@ -126,7 +168,7 @@ def get_effective_plan(db: Session, user_id: int) -> tuple[str, UserSubscription
     """Returns effective plan id ('free' or 'pro') and subscription record.
 
     Never interprets missing or error state as Pro.
-    Automatically checks and enforces expiration on paid Pro subscriptions.
+    Automatically checks and enforces expiration on paid Pro subscriptions even if worker is delayed.
     """
     try:
         sub = get_or_create_subscription(db, user_id)
@@ -138,9 +180,27 @@ def get_effective_plan(db: Session, user_id: int) -> tuple[str, UserSubscription
                 end_time = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
                 if now > end_time:
                     logger.info(f"User {user_id} Pro subscription expired at {sub.current_period_end}. Downgrading to Free.")
+                    previous_plan = sub.plan
                     sub.plan = "free"
                     sub.status = "expired"
                     sub.updated_at = now
+
+                    record_subscription_audit_event(
+                        db=db,
+                        user_id=user_id,
+                        subscription_id=sub.id,
+                        previous_plan=previous_plan,
+                        new_plan="free",
+                        event_type="pro_expired",
+                        reason="period_ended",
+                        commit=False,
+                    )
+
+                    user = db.get(User, user_id)
+                    if user:
+                        from app.services.email_service import enqueue_subscription_expired_email
+                        enqueue_subscription_expired_email(db, user, sub)
+
                     try:
                         db.commit()
                         db.refresh(sub)
@@ -226,6 +286,8 @@ def get_subscription_usage(db: Session, user_id: int) -> dict[str, Any]:
         "http_monitors": {
             "used": http_used,
             "limit": http_limit,
+            "active_count": min(http_used, http_limit),
+            "restricted_count": max(0, http_used - http_limit),
             "over_limit": http_used > http_limit,
             "at_limit": http_used >= http_limit,
             "remaining": max(0, http_limit - http_used),
@@ -233,6 +295,8 @@ def get_subscription_usage(db: Session, user_id: int) -> dict[str, Any]:
         "heartbeat_monitors": {
             "used": heartbeat_used,
             "limit": heartbeat_limit,
+            "active_count": min(heartbeat_used, heartbeat_limit),
+            "restricted_count": max(0, heartbeat_used - heartbeat_limit),
             "over_limit": heartbeat_used > heartbeat_limit,
             "at_limit": heartbeat_used >= heartbeat_limit,
             "remaining": max(0, heartbeat_limit - heartbeat_used),
@@ -240,6 +304,8 @@ def get_subscription_usage(db: Session, user_id: int) -> dict[str, Any]:
         "status_pages": {
             "used": status_pages_used,
             "limit": status_pages_limit,
+            "active_count": min(status_pages_used, status_pages_limit),
+            "restricted_count": max(0, status_pages_used - status_pages_limit),
             "over_limit": status_pages_used > status_pages_limit,
             "at_limit": status_pages_used >= status_pages_limit,
             "remaining": max(0, status_pages_limit - status_pages_used),
@@ -437,7 +503,8 @@ def switch_user_plan_dev(
             detail=f"Invalid plan '{new_plan}'. Must be one of: {list(PLAN_CONFIG.keys())}",
         )
 
-    sub = get_or_create_subscription(db, user_id)
+    sub = get_or_create_subscription(db, user_id, commit=False)
+    previous_plan = sub.plan
     sub.plan = plan_clean
     sub.status = "active"
     sub.legacy_override = legacy_override
@@ -445,9 +512,25 @@ def switch_user_plan_dev(
     sub.updated_at = utcnow()
     if plan_clean == "pro":
         sub.current_period_start = utcnow()
+        sub.current_period_end = utcnow() + timedelta(days=30)
     else:
         sub.current_period_start = None
         sub.current_period_end = None
+
+    event_type = "admin_override_enabled" if legacy_override else (
+        "pro_activated" if plan_clean == "pro" else "pro_downgraded"
+    )
+
+    record_subscription_audit_event(
+        db=db,
+        user_id=user_id,
+        subscription_id=sub.id,
+        previous_plan=previous_plan,
+        new_plan=plan_clean,
+        event_type=event_type,
+        reason=reason,
+        commit=False,
+    )
 
     db.commit()
     db.refresh(sub)
@@ -464,38 +547,65 @@ def activate_pro_from_payment(
 ) -> UserSubscription:
     """Activates or extends 30 days of Pro entitlements after a verified payment.
 
-    If user already has an active paid Pro subscription, extends from existing end date.
+    Cases handled:
+    A. Free -> Pro: Start Pro access; set expiration = payment activation time + 30 days.
+    B. Active Pro -> Extended Pro: New expiration = previous current_period_end + 30 days. Never discards remaining time.
+    C. Expired Pro -> Pro: New expiration = payment activation time + 30 days.
+    D. Grandfathered legacy accounts: Preserves legacy_override while updating payment period end.
+
+    Concurrency:
+    Locks subscription row in PostgreSQL to serialize concurrent renewal and background expiration jobs.
+    Records SubscriptionAuditLog atomically.
     When commit=False, caller owns the database transaction and flushes changes without committing.
     """
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(
+            select(UserSubscription.id)
+            .where(UserSubscription.user_id == user_id)
+            .with_for_update()
+        )
+
     sub = get_or_create_subscription(db, user_id, commit=commit)
     now = utcnow()
+    previous_plan = sub.plan
 
+    cur_end = ensure_utc(sub.current_period_end)
     if getattr(sub, "legacy_override", False):
-        # Account has grandfathered legacy Pro; preserve legacy_override while recording paid period
         sub.plan = "pro"
         sub.status = "active"
         sub.current_period_start = now
         sub.current_period_end = now + timedelta(days=duration_days)
         sub.override_reason = f"xendit_payment:{transaction_id} (legacy grandfathered)"
-    elif (
-        sub.plan == "pro"
-        and sub.current_period_end is not None
-    ):
-        # Active paid Pro; extend end date
-        end_tz = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
-        base_time = max(end_tz, now)
-        sub.current_period_end = base_time + timedelta(days=duration_days)
+        event_type = "pro_extended" if previous_plan == "pro" else "pro_activated"
+    elif sub.plan == "pro" and cur_end is not None and cur_end > now:
+        # Active paid Pro; extend end date from current_period_end
+        sub.current_period_end = cur_end + timedelta(days=duration_days)
         sub.override_reason = f"xendit_payment:{transaction_id}"
+        event_type = "pro_extended"
     else:
-        # Free tier or manual Pro without an expiration date; establish new paid period
+        # Free tier or expired Pro
         sub.plan = "pro"
         sub.status = "active"
         sub.current_period_start = now
         sub.current_period_end = now + timedelta(days=duration_days)
         sub.override_reason = f"xendit_payment:{transaction_id}"
+        event_type = "pro_activated"
 
     sub.cancel_at_period_end = False
     sub.updated_at = now
+
+    record_subscription_audit_event(
+        db=db,
+        user_id=user_id,
+        subscription_id=sub.id,
+        previous_plan=previous_plan,
+        new_plan="pro",
+        event_type=event_type,
+        reason=f"xendit_payment:{transaction_id}",
+        payment_transaction_id=transaction_id,
+        commit=False,
+    )
 
     if commit:
         db.commit()
@@ -503,6 +613,216 @@ def activate_pro_from_payment(
     else:
         db.flush()
 
-    logger.info(f"User {user_id} activated Pro subscription until {sub.current_period_end} via tx {transaction_id} (commit={commit})")
+    logger.info(f"User {user_id} {event_type} Pro subscription until {sub.current_period_end} via tx {transaction_id} (commit={commit})")
     return sub
+
+
+def get_eligible_resource_ids(
+    db: Session,
+    user_id: int,
+    resource_type: str = "http",
+) -> set[int]:
+    """Returns the set of resource IDs eligible under the user's active plan limits.
+
+    Deterministic policy:
+    1. Pro users and grandfathered legacy_override users receive full Pro quotas (20 HTTP, 20 Heartbeat, 5 Status Pages).
+    2. Free users are restricted to Free quotas (3 HTTP, 1 Heartbeat, 1 Status Page).
+    3. Eligible resources are selected deterministically by earliest creation: ORDER BY created_at ASC, id ASC.
+    4. Resources beyond the quota remain safely saved but are marked as plan-restricted and skipped from worker checks.
+    """
+    entitlements = get_entitlements(db, user_id)
+
+    if resource_type == "http":
+        limit = entitlements["max_http_monitors"]
+        ids = db.scalars(
+            select(Monitor.id)
+            .where(
+                Monitor.user_id == user_id,
+                Monitor.type == "http",
+            )
+            .order_by(Monitor.created_at.asc(), Monitor.id.asc())
+            .limit(limit)
+        ).all()
+        return set(ids)
+
+    elif resource_type == "heartbeat":
+        limit = entitlements["max_heartbeat_monitors"]
+        ids = db.scalars(
+            select(Monitor.id)
+            .where(
+                Monitor.user_id == user_id,
+                Monitor.type == "heartbeat",
+            )
+            .order_by(Monitor.created_at.asc(), Monitor.id.asc())
+            .limit(limit)
+        ).all()
+        return set(ids)
+
+    elif resource_type == "status_page":
+        limit = entitlements["max_status_pages"]
+        ids = db.scalars(
+            select(StatusPage.id)
+            .where(StatusPage.user_id == user_id)
+            .order_by(StatusPage.created_at.asc(), StatusPage.id.asc())
+            .limit(limit)
+        ).all()
+        return set(ids)
+
+    return set()
+
+
+def process_subscription_expirations(db: Session) -> dict[str, Any]:
+    """Evaluates and processes all expired Pro subscriptions.
+
+    Requirements:
+    1. Finds subscriptions with plan='pro', current_period_end < now, legacy_override=False.
+    2. Concurrency-safe: Locks row with SELECT FOR UPDATE to prevent race condition with renewals.
+    3. Re-verifies expiration condition after acquiring lock.
+    4. Transitions subscription to plan='free', status='expired'.
+    5. Records audit event 'pro_expired'.
+    6. Enqueues expiration confirmation email.
+    7. Retains all user monitors, history, and payment records without deletion.
+    """
+    now = utcnow()
+
+    query = (
+        select(UserSubscription)
+        .where(
+            UserSubscription.plan == "pro",
+            UserSubscription.current_period_end.is_not(None),
+            UserSubscription.current_period_end <= now,
+            UserSubscription.legacy_override.is_(False),
+        )
+    )
+
+    try:
+        bind = db.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        expired_subs = db.scalars(query).all()
+    except Exception:
+        db.rollback()
+        expired_subs = db.scalars(
+            select(UserSubscription)
+            .where(
+                UserSubscription.plan == "pro",
+                UserSubscription.current_period_end.is_not(None),
+                UserSubscription.current_period_end <= now,
+                UserSubscription.legacy_override.is_(False),
+            )
+        ).all()
+
+    expired_count = 0
+
+    for sub in expired_subs:
+        end_tz = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
+        if sub.plan != "pro" or sub.legacy_override or end_tz > now:
+            continue
+
+        previous_plan = sub.plan
+        sub.plan = "free"
+        sub.status = "expired"
+        sub.updated_at = now
+
+        record_subscription_audit_event(
+            db=db,
+            user_id=sub.user_id,
+            subscription_id=sub.id,
+            previous_plan=previous_plan,
+            new_plan="free",
+            event_type="pro_expired",
+            reason="period_ended",
+            commit=False,
+        )
+
+        user = db.get(User, sub.user_id)
+        if user:
+            from app.services.email_service import enqueue_subscription_expired_email
+            enqueue_subscription_expired_email(db, user, sub)
+
+        db.commit()
+        expired_count += 1
+        logger.info(f"Processed expiration for user {sub.user_id}, downgraded to Free.")
+
+    return {"processed": len(expired_subs), "expired": expired_count}
+
+
+def process_subscription_reminders(db: Session) -> dict[str, Any]:
+    """Finds active Pro subscriptions nearing expiration and queues transactional reminders.
+
+    Thresholds:
+    - 7 days before expiration: sent when remaining time is between 6.0 and 7.5 days
+    - 3 days before expiration: sent when remaining time is between 2.0 and 3.5 days
+    - 1 day before expiration: sent when remaining time is between 0.0 and 1.5 days
+
+    Deduplicated via database outbox key:
+    'sub_reminder:{sub.id}:{sub.current_period_end_timestamp}:{threshold}d'
+    Stale thresholds are not sent if workers were delayed.
+    """
+    now = utcnow()
+    active_pro_subs = db.scalars(
+        select(UserSubscription)
+        .where(
+            UserSubscription.plan == "pro",
+            UserSubscription.current_period_end.is_not(None),
+            UserSubscription.current_period_end > now,
+            UserSubscription.legacy_override.is_(False),
+        )
+    ).all()
+
+    queued_count = 0
+    from app.services.email_service import enqueue_subscription_reminder_email
+
+    for sub in active_pro_subs:
+        end_tz = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
+        delta = end_tz - now
+        days_left = delta.total_seconds() / 86400.0
+
+        user = db.get(User, sub.user_id)
+        if not user or not user.email:
+            continue
+
+        # Evaluate 1-day threshold (0.0 <= days_left <= 1.5)
+        if 0.0 <= days_left <= 1.5:
+            d = enqueue_subscription_reminder_email(db, user, sub, threshold_days=1)
+            if d:
+                db.commit()
+                queued_count += 1
+
+        # Evaluate 3-day threshold (2.0 <= days_left <= 3.5)
+        elif 2.0 <= days_left <= 3.5:
+            d = enqueue_subscription_reminder_email(db, user, sub, threshold_days=3)
+            if d:
+                db.commit()
+                queued_count += 1
+
+        # Evaluate 7-day threshold (6.0 <= days_left <= 7.5)
+        elif 6.0 <= days_left <= 7.5:
+            d = enqueue_subscription_reminder_email(db, user, sub, threshold_days=7)
+            if d:
+                db.commit()
+                queued_count += 1
+
+    return {"active_pro_count": len(active_pro_subs), "reminders_queued": queued_count}
+
+
+def run_subscription_lifecycle_jobs(db: Session | None = None) -> dict[str, Any]:
+    """Runs all subscription lifecycle background maintenance tasks."""
+    from app.database import SessionLocal
+    close_session = False
+    if db is None:
+        db = SessionLocal()
+        close_session = True
+
+    try:
+        exp_res = process_subscription_expirations(db)
+        rem_res = process_subscription_reminders(db)
+        return {
+            "expirations": exp_res,
+            "reminders": rem_res,
+        }
+    finally:
+        if close_session:
+            db.close()
+
 

@@ -21,22 +21,34 @@ def utcnow() -> datetime:
 def get_due_monitor_ids(db: Session) -> list[int]:
     now = utcnow()
 
-    monitor_ids = list(
-        db.scalars(
-            select(Monitor.id)
-            .where(
-                Monitor.is_active.is_(True),
-                Monitor.type == "http",
-                or_(
-                    Monitor.next_check_at.is_(None),
-                    Monitor.next_check_at <= now,
-                ),
-            )
-            .order_by(Monitor.next_check_at.asc().nullsfirst())
-        ).all()
-    )
+    candidates = db.scalars(
+        select(Monitor)
+        .where(
+            Monitor.is_active.is_(True),
+            Monitor.type == "http",
+            or_(
+                Monitor.next_check_at.is_(None),
+                Monitor.next_check_at <= now,
+            ),
+        )
+        .order_by(Monitor.next_check_at.asc().nullsfirst())
+    ).all()
 
-    return monitor_ids
+    if not candidates:
+        return []
+
+    from app.services.subscription_service import get_eligible_resource_ids
+
+    user_eligible_map: dict[int, set[int]] = {}
+    eligible_ids = []
+
+    for m in candidates:
+        if m.user_id not in user_eligible_map:
+            user_eligible_map[m.user_id] = get_eligible_resource_ids(db, m.user_id, "http")
+        if m.id in user_eligible_map[m.user_id]:
+            eligible_ids.append(m.id)
+
+    return eligible_ids
 
 
 def apply_check_result(

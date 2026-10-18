@@ -16,6 +16,7 @@ from app.models.email_delivery import EmailDelivery
 from app.models.monitor import Monitor
 from app.models.notification import Notification
 from app.models.notification_preference import NotificationPreference
+from app.models.subscription import UserSubscription
 from app.models.user import User
 
 logger = logging.getLogger("raytech.email")
@@ -459,6 +460,301 @@ This email serves as a payment confirmation receipt for your records and is not 
     return text_content, html_content
 
 
+WIB = timezone(timedelta(hours=7))
+
+
+def format_wib_datetime(dt: datetime | None) -> str:
+    """Formats a datetime in Asia/Jakarta timezone (WIB, UTC+7)."""
+    if not dt:
+        return "N/A"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    wib_dt = dt.astimezone(WIB)
+    return wib_dt.strftime("%d %b %Y, %H:%M WIB")
+
+
+def render_subscription_reminder_email(
+    customer_name: str | None,
+    recipient_email: str,
+    expiration_date: datetime,
+    threshold_days: int,
+) -> tuple[str, str]:
+    """Renders HTML and plain-text reminder email for an upcoming Pro subscription expiration."""
+    safe_name = html.escape(customer_name.strip()) if customer_name and customer_name.strip() else None
+    safe_greeting = safe_name or "Customer"
+    safe_email = html.escape(recipient_email)
+    safe_expiry = format_wib_datetime(expiration_date)
+    frontend_url = get_frontend_url()
+    safe_billing_link = html.escape(f"{frontend_url}/settings/billing")
+
+    if threshold_days == 1:
+        time_heading = "Final Reminder: Pro Expires Tomorrow"
+        time_badge = "24 HOURS REMAINING"
+        badge_bg = "#451a1a"
+        badge_border = "#f43f5e"
+        badge_color = "#fda4af"
+        urgency_msg = "Your 30-day Pro subscription expires in 24 hours. Extend today to preserve continuous 1-minute monitoring, SSL checks, and active alerting."
+    elif threshold_days == 3:
+        time_heading = "Action Required: 3 Days Left on Pro"
+        time_badge = "3 DAYS REMAINING"
+        badge_bg = "#3b2609"
+        badge_border = "#f59e0b"
+        badge_color = "#fcd34d"
+        urgency_msg = "Your 30-day Pro subscription expires in 3 days. Extend your access at your convenience to maintain high-frequency monitoring."
+    else:
+        time_heading = "Subscription Expiration Notice"
+        time_badge = "7 DAYS REMAINING"
+        badge_bg = "#162e3d"
+        badge_border = "#06b6d4"
+        badge_color = "#67e8f9"
+        urgency_msg = "Your 30-day Pro subscription will expire in 7 days. Your plan does not automatically renew, so you may extend anytime from your billing settings."
+
+    text_content = f"""RAYTECH / MONITOR — {time_heading.upper()}
+
+Hello {safe_greeting},
+
+{urgency_msg}
+
+Subscription Details:
+- Current Plan: Raytech Monitor Pro
+- Expiration Date: {safe_expiry}
+- Remaining Time: {time_badge}
+- Auto-Renewal: Non-recurring (Manual renewal)
+
+Extend Pro (+30 Days for IDR 49,000):
+{safe_billing_link}
+
+Note:
+All your monitors, heartbeats, and historical data will remain safely preserved in your account even if your plan expires.
+
+Raytech Cloud Services — https://monitor.raytech.cloud
+"""
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{time_heading}</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #050608; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #f0f6fc;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color: #050608; padding: 32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width: 580px; background-color: #0d0f12; border: 1px solid #22262b; border-radius: 6px; overflow: hidden;" cellspacing="0" cellpadding="0" border="0">
+          <!-- Header -->
+          <tr>
+            <td style="padding: 24px 28px; border-bottom: 1px solid #1a1e23; background-color: #090a0d;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                <tr>
+                  <td>
+                    <span style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; letter-spacing: 0.15em; color: #8b949e; text-transform: uppercase;">RAYTECH / MONITOR</span>
+                    <h1 style="margin: 6px 0 0; font-size: 18px; font-weight: 600; color: #f0f6fc; letter-spacing: -0.02em;">{time_heading}</h1>
+                  </td>
+                  <td align="right" valign="middle">
+                    <span style="display: inline-block; padding: 4px 10px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; background-color: {badge_bg}; border: 1px solid {badge_border}; color: {badge_color};">
+                      {time_badge}
+                    </span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Message Body -->
+          <tr>
+            <td style="padding: 28px;">
+              <p style="margin: 0 0 16px; font-size: 14px; color: #c9d1d9; line-height: 1.5;">
+                Hello <strong style="color: #f0f6fc;">{safe_greeting}</strong>,
+              </p>
+              <p style="margin: 0 0 20px; font-size: 13px; color: #8b949e; line-height: 1.6;">
+                {urgency_msg}
+              </p>
+
+              <!-- Summary Table -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size: 13px; line-height: 1.6; border: 1px solid #22262b; border-radius: 4px; background-color: #0c0d0e; margin-bottom: 24px;">
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e; width: 140px;">Current Plan</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #f0f6fc; font-weight: 600;">Raytech Monitor Pro</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Expiration Date</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #f0f6fc; font-family: ui-monospace, monospace;">{safe_expiry}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Renewal Type</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #c9d1d9;">Manual Pass (No Auto-Debit)</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; color: #8b949e;">Resource Safety</td>
+                  <td style="padding: 12px 16px; color: #22c55e;">100% Preserved in Account</td>
+                </tr>
+              </table>
+
+              <!-- Call to Action -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 24px;">
+                <tr>
+                  <td>
+                    <a href="{safe_billing_link}" target="_blank" style="display: inline-block; background-color: #06b6d4; color: #081014; font-size: 13px; font-weight: 600; text-decoration: none; padding: 11px 20px; border-radius: 4px;">
+                      Extend Pro (+30 Days) &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+
+              <div style="padding: 12px 16px; background-color: #121519; border: 1px solid #22262b; border-radius: 4px; font-size: 11px; color: #8b949e; line-height: 1.5;">
+                <strong style="color: #c9d1d9;">Non-Recurring Pass:</strong> Raytech Monitor Pro does not charge your card automatically. If you choose not to extend, your monitors remain saved and excess resources are simply paused under Free limits.
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 16px 28px; background-color: #0f1113; border-top: 1px solid #22262b; font-size: 11px; color: #6e7681; line-height: 1.5;">
+              Raytech Cloud Services &bull; <a href="{safe_billing_link}" target="_blank" style="color: #06b6d4; text-decoration: none;">Account Billing Settings</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+    return text_content, html_content
+
+
+def render_subscription_expired_email(
+    customer_name: str | None,
+    recipient_email: str,
+    expired_at: datetime,
+) -> tuple[str, str]:
+    """Renders HTML and plain-text notification for an expired Pro subscription."""
+    safe_name = html.escape(customer_name.strip()) if customer_name and customer_name.strip() else None
+    safe_greeting = safe_name or "Customer"
+    safe_email = html.escape(recipient_email)
+    safe_expired = format_wib_datetime(expired_at)
+    frontend_url = get_frontend_url()
+    safe_billing_link = html.escape(f"{frontend_url}/settings/billing")
+
+    text_content = f"""RAYTECH / MONITOR — SUBSCRIPTION EXPIRED
+
+Hello {safe_greeting},
+
+Your Raytech Monitor Pro subscription period has ended and your account has transitioned to the Free plan.
+
+Summary:
+- Previous Plan: Raytech Monitor Pro
+- Current Plan: Free Tier
+- Expired On: {safe_expired}
+- Status: Free Access Active
+
+What happens next?
+- All your monitors, heartbeats, and incident history remain safely saved.
+- Resources exceeding Free limits (up to 3 HTTP monitors, 1 Heartbeat, 1 Status Page) are currently restricted from automated checks.
+- You can reactivate Pro at any time to immediately unrestrict all monitors.
+- No automatic charges have occurred.
+
+Reactivate Pro (+30 Days for IDR 49,000):
+{safe_billing_link}
+
+Raytech Cloud Services — https://monitor.raytech.cloud
+"""
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pro Subscription Expired</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #050608; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #f0f6fc;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color: #050608; padding: 32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width: 580px; background-color: #0d0f12; border: 1px solid #22262b; border-radius: 6px; overflow: hidden;" cellspacing="0" cellpadding="0" border="0">
+          <!-- Header -->
+          <tr>
+            <td style="padding: 24px 28px; border-bottom: 1px solid #1a1e23; background-color: #090a0d;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                <tr>
+                  <td>
+                    <span style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; letter-spacing: 0.15em; color: #8b949e; text-transform: uppercase;">RAYTECH / MONITOR</span>
+                    <h1 style="margin: 6px 0 0; font-size: 18px; font-weight: 600; color: #f0f6fc; letter-spacing: -0.02em;">Pro Subscription Expired</h1>
+                  </td>
+                  <td align="right" valign="middle">
+                    <span style="display: inline-block; padding: 4px 10px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; background-color: #2b1f14; border: 1px solid #f59e0b; color: #fbbf24;">
+                      FREE ACTIVE
+                    </span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Message Body -->
+          <tr>
+            <td style="padding: 28px;">
+              <p style="margin: 0 0 16px; font-size: 14px; color: #c9d1d9; line-height: 1.5;">
+                Hello <strong style="color: #f0f6fc;">{safe_greeting}</strong>,
+              </p>
+              <p style="margin: 0 0 20px; font-size: 13px; color: #8b949e; line-height: 1.6;">
+                Your 30-day Pro subscription has concluded and your account has transitioned to the Free tier. All your monitors, heartbeats, status pages, and incident logs remain <strong style="color: #f0f6fc;">100% saved</strong>.
+              </p>
+
+              <!-- Summary Table -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size: 13px; line-height: 1.6; border: 1px solid #22262b; border-radius: 4px; background-color: #0c0d0e; margin-bottom: 24px;">
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e; width: 140px;">Current Plan</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #f0f6fc; font-weight: 600;">Free Tier (Active)</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Expired On</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #f0f6fc; font-family: ui-monospace, monospace;">{safe_expired}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Resource Status</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #22c55e;">Preserved (3 HTTP monitors eligible)</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; color: #8b949e;">Automatic Charges</td>
+                  <td style="padding: 12px 16px; color: #8b949e;">None (No card charged)</td>
+                </tr>
+              </table>
+
+              <!-- Call to Action -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 24px;">
+                <tr>
+                  <td>
+                    <a href="{safe_billing_link}" target="_blank" style="display: inline-block; background-color: #06b6d4; color: #081014; font-size: 13px; font-weight: 600; text-decoration: none; padding: 11px 20px; border-radius: 4px;">
+                      Reactivate Pro (+30 Days) &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+
+              <div style="padding: 12px 16px; background-color: #121519; border: 1px solid #22262b; border-radius: 4px; font-size: 11px; color: #8b949e; line-height: 1.5;">
+                <strong style="color: #c9d1d9;">Plan Restrictions:</strong> Resources exceeding Free limits (over 3 HTTP monitors, 1 Heartbeat, or 1 Status page) are paused from automated scheduling. You can reactivate Pro at any time to instantly resume full monitoring.
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 16px 28px; background-color: #0f1113; border-top: 1px solid #22262b; font-size: 11px; color: #6e7681; line-height: 1.5;">
+              Raytech Cloud Services &bull; <a href="{safe_billing_link}" target="_blank" style="color: #06b6d4; text-decoration: none;">Account Billing Settings</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+    return text_content, html_content
+
+
 def enqueue_email_for_notification(
     db: Session,
     notification: Notification,
@@ -647,6 +943,120 @@ def enqueue_payment_confirmation_email(
     db.add(delivery)
     db.flush()
     logger.info(f"Enqueued payment confirmation email for user {user.id}, tx {transaction.id} ({idempotency_key})")
+    return delivery
+
+
+def enqueue_subscription_reminder_email(
+    db: Session,
+    user: User,
+    subscription: Any,
+    threshold_days: int,
+) -> EmailDelivery | None:
+    """Enqueues a subscription expiration reminder outbox record.
+
+    Guarantees exactly-once queueing per subscription expiration period using idempotency key:
+    'sub_reminder:{subscription.id}:{subscription.current_period_end_timestamp}:{threshold_days}d'.
+    """
+    if not user.email:
+        logger.warning(f"Cannot enqueue expiration reminder: user {user.id} has no email address.")
+        return None
+
+    if not subscription.current_period_end:
+        return None
+
+    end_ts = subscription.current_period_end.strftime("%Y%m%d%H%M")
+    idempotency_key = f"sub_reminder:{subscription.id}:{end_ts}:{threshold_days}d"
+
+    # Check for existing delivery with this idempotency key
+    existing = db.scalar(
+        select(EmailDelivery).where(EmailDelivery.idempotency_key == idempotency_key)
+    )
+    if existing is not None:
+        logger.info(f"Expiration reminder ({threshold_days}d) already enqueued for sub {subscription.id} ({idempotency_key})")
+        return None
+
+    if threshold_days == 1:
+        subject = "[Raytech Monitor] Final reminder: Pro subscription expires tomorrow"
+    elif threshold_days == 3:
+        subject = "[Raytech Monitor] Action required: 3 days left on your Pro plan"
+    else:
+        subject = "[Raytech Monitor] Your Pro subscription expires in 7 days"
+
+    text_body, html_body = render_subscription_reminder_email(
+        customer_name=user.name,
+        recipient_email=user.email,
+        expiration_date=subscription.current_period_end,
+        threshold_days=threshold_days,
+    )
+
+    delivery = EmailDelivery(
+        notification_id=None,
+        user_id=user.id,
+        recipient_email=user.email,
+        provider="resend",
+        event_type=f"sub_reminder_{threshold_days}d",
+        idempotency_key=idempotency_key,
+        subject=subject,
+        body_text=text_body,
+        body_html=html_body,
+        status="pending",
+        attempt_count=0,
+        next_attempt_at=utcnow(),
+    )
+    db.add(delivery)
+    db.flush()
+    logger.info(f"Enqueued {threshold_days}d expiration reminder for user {user.id}, sub {subscription.id} ({idempotency_key})")
+    return delivery
+
+
+def enqueue_subscription_expired_email(
+    db: Session,
+    user: User,
+    subscription: Any,
+) -> EmailDelivery | None:
+    """Enqueues a subscription expired confirmation outbox record.
+
+    Guarantees exactly-once queueing per expired subscription period using idempotency key:
+    'sub_expired:{subscription.id}:{subscription.current_period_end_timestamp}'.
+    """
+    if not user.email:
+        logger.warning(f"Cannot enqueue expired confirmation: user {user.id} has no email address.")
+        return None
+
+    end_ts = subscription.current_period_end.strftime("%Y%m%d%H%M") if subscription.current_period_end else "none"
+    idempotency_key = f"sub_expired:{subscription.id}:{end_ts}"
+
+    existing = db.scalar(
+        select(EmailDelivery).where(EmailDelivery.idempotency_key == idempotency_key)
+    )
+    if existing is not None:
+        logger.info(f"Expiration confirmation already enqueued for sub {subscription.id} ({idempotency_key})")
+        return None
+
+    subject = "Your Raytech Monitor Pro subscription has expired"
+    text_body, html_body = render_subscription_expired_email(
+        customer_name=user.name,
+        recipient_email=user.email,
+        expired_at=subscription.current_period_end or utcnow(),
+    )
+
+    delivery = EmailDelivery(
+        notification_id=None,
+        user_id=user.id,
+        recipient_email=user.email,
+        provider="resend",
+        event_type="sub_expired",
+        idempotency_key=idempotency_key,
+        subject=subject,
+        body_text=text_body,
+        body_html=html_body,
+        status="pending",
+        attempt_count=0,
+        next_attempt_at=utcnow(),
+    )
+    db.add(delivery)
+    db.flush()
+    logger.info(f"Enqueued Pro expiration confirmation email for user {user.id}, sub {subscription.id} ({idempotency_key})")
     return delivery
 
 
@@ -842,6 +1252,56 @@ def process_pending_email_deliveries(db: Session | None = None) -> dict:
             # Refresh row state
             db.refresh(delivery)
 
+            # Dispatch-time validity check for subscription lifecycle reminders:
+            # If the user extended/renewed, expired, or downgraded to Free since queueing,
+            # do not send an obsolete or misleading reminder.
+            if delivery.event_type.startswith("sub_reminder_"):
+                sub = db.scalar(
+                    select(UserSubscription).where(UserSubscription.user_id == delivery.user_id)
+                )
+                is_stale = False
+                stale_reason = ""
+                if sub is None:
+                    is_stale = True
+                    stale_reason = "Subscription record no longer exists."
+                elif sub.plan != "pro" or sub.status != "active":
+                    is_stale = True
+                    stale_reason = f"User is no longer an active Pro subscriber (plan={sub.plan}, status={sub.status})."
+                elif sub.current_period_end is None:
+                    is_stale = True
+                    stale_reason = "Subscription current_period_end is None."
+                else:
+                    end_tz = (
+                        sub.current_period_end
+                        if sub.current_period_end.tzinfo
+                        else sub.current_period_end.replace(tzinfo=timezone.utc)
+                    )
+                    now_utc = utcnow()
+                    if end_tz <= now_utc:
+                        is_stale = True
+                        stale_reason = "Subscription has already expired."
+                    else:
+                        # Idempotency key format: sub_reminder:{sub_id}:{end_ts}:{threshold}d
+                        expected_end_ts = sub.current_period_end.strftime("%Y%m%d%H%M")
+                        if delivery.idempotency_key and f":{expected_end_ts}:" not in delivery.idempotency_key:
+                            is_stale = True
+                            stale_reason = "Subscription was extended or renewed after reminder was queued."
+
+                if is_stale:
+                    delivery.status = "skipped"
+                    delivery.last_error_code = "STALE_REMINDER"
+                    delivery.last_error_message = f"Skipped at dispatch: {stale_reason}"
+                    delivery.updated_at = utcnow()
+                    db.commit()
+                    skipped_count += 1
+                    logger.info(
+                        "Skipped dispatch of stale reminder (id=%s, user=%s): %s",
+                        delivery.id,
+                        delivery.user_id,
+                        stale_reason,
+                    )
+                    continue
+
             # Check global limit
             recent_global_sent = count_recent_sent_emails(db)
             if recent_global_sent >= daily_limit:
@@ -886,6 +1346,7 @@ def process_pending_email_deliveries(db: Session | None = None) -> dict:
             sender_address = (
                 get_billing_email_from()
                 if delivery.event_type == "payment_confirmed"
+                or delivery.event_type.startswith("sub_")
                 else from_address
             )
 

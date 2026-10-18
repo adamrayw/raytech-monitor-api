@@ -39,6 +39,15 @@ def get_published_status_page_or_404(db: Session, slug: str) -> StatusPage:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Status page not found.",
         )
+
+    from app.services.subscription_service import get_eligible_resource_ids
+    eligible_pages = get_eligible_resource_ids(db, page.user_id, "status_page")
+    if page.id not in eligible_pages:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Status page unavailable under current plan.",
+        )
+
     return page
 
 

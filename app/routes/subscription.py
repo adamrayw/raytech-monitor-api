@@ -88,6 +88,30 @@ def get_user_subscription(
         payment_method = "Not required"
         billing_cycle = "N/A"
 
+    from datetime import datetime, timezone
+    from app.services.email_service import format_wib_datetime
+
+    now = datetime.now(timezone.utc)
+    remaining_seconds = 0
+    if is_pro and sub.current_period_end:
+        end_tz = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
+        remaining_seconds = max(0, int((end_tz - now).total_seconds()))
+
+    end_wib = format_wib_datetime(sub.current_period_end) if sub.current_period_end else None
+    is_expired_pro = (sub.status == "expired") or (not is_pro and tx_count > 0)
+
+    billing_summary = {
+        "plan_id": plan_id,
+        "plan_name": entitlements["name"],
+        "status": sub.status,
+        "status_display": "Pro Active" if is_pro else ("Plan Expired" if is_expired_pro else "Free Active"),
+        "payment_method": payment_method,
+        "billing_cycle": billing_cycle,
+        "renewal_date": sub.current_period_end.isoformat() if (is_pro and sub.current_period_end) else None,
+        "invoices_count": tx_count,
+        "auto_renew": False,
+    }
+
     return {
         "plan": plan_id,
         "name": entitlements["name"],
@@ -98,6 +122,10 @@ def get_user_subscription(
         "started_at": sub.started_at.isoformat() if sub.started_at else None,
         "current_period_start": sub.current_period_start.isoformat() if sub.current_period_start else None,
         "current_period_end": sub.current_period_end.isoformat() if sub.current_period_end else None,
+        "current_period_end_wib": end_wib,
+        "remaining_seconds": remaining_seconds,
+        "is_expired_pro": is_expired_pro,
+        "auto_renew": False,
         "cancel_at_period_end": sub.cancel_at_period_end,
         "legacy_override": sub.legacy_override,
         "upgrade_available": not is_pro,
@@ -105,6 +133,7 @@ def get_user_subscription(
         "billing_cycle": billing_cycle,
         "renewal_date": sub.current_period_end.isoformat() if (is_pro and sub.current_period_end) else None,
         "invoices_count": tx_count,
+        "billing_summary": billing_summary,
         "entitlements": {
             "max_http_monitors": entitlements["max_http_monitors"],
             "min_http_interval_seconds": entitlements["min_http_interval_seconds"],

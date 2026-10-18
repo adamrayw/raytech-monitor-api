@@ -143,6 +143,7 @@ class MonitorResponse(BaseModel):
 
     created_at: datetime
     updated_at: datetime
+    is_restricted_by_plan: bool = False
 
 
 class MonitorListResponse(BaseModel):

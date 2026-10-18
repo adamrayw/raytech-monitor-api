@@ -159,19 +159,32 @@ def process_heartbeat(
 def get_overdue_heartbeat_monitor_ids(db: Session) -> list[int]:
     """Retrieve IDs of active healthy heartbeat monitors past their deadline."""
     now = utcnow()
-    return list(
-        db.scalars(
-            select(Monitor.id)
-            .where(
-                Monitor.is_active.is_(True),
-                Monitor.type == "heartbeat",
-                Monitor.status == "healthy",
-                Monitor.deadline_at.is_not(None),
-                Monitor.deadline_at <= now,
-            )
-            .order_by(Monitor.deadline_at.asc())
-        ).all()
-    )
+    candidates = db.scalars(
+        select(Monitor)
+        .where(
+            Monitor.is_active.is_(True),
+            Monitor.type == "heartbeat",
+            Monitor.status == "healthy",
+            Monitor.deadline_at.is_not(None),
+            Monitor.deadline_at <= now,
+        )
+        .order_by(Monitor.deadline_at.asc())
+    ).all()
+
+    if not candidates:
+        return []
+
+    from app.services.subscription_service import get_eligible_resource_ids
+    user_hb_map: dict[int, set[int]] = {}
+    eligible_ids = []
+
+    for m in candidates:
+        if m.user_id not in user_hb_map:
+            user_hb_map[m.user_id] = get_eligible_resource_ids(db, m.user_id, "heartbeat")
+        if m.id in user_hb_map[m.user_id]:
+            eligible_ids.append(m.id)
+
+    return eligible_ids
 
 
 def evaluate_overdue_heartbeat(db: Session, monitor_id: int) -> bool:

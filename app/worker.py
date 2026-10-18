@@ -1,6 +1,7 @@
 import asyncio
 import json
 import signal
+import time
 from datetime import datetime, timezone
 
 from app.services.monitor_runner import run_due_monitors
@@ -44,6 +45,8 @@ async def worker_loop():
         ),
         flush=True,
     )
+
+    last_lifecycle_check: float = 0.0
 
     while not shutdown_event.is_set():
         try:
@@ -123,6 +126,42 @@ async def worker_loop():
                     ),
                     flush=True,
                 )
+
+            # Run periodic subscription lifecycle maintenance (every 5 minutes / 300s)
+            current_time = time.monotonic()
+            if current_time - last_lifecycle_check >= 300:
+                last_lifecycle_check = current_time
+                try:
+                    from app.services.subscription_service import run_subscription_lifecycle_jobs
+                    lifecycle_result = await asyncio.to_thread(run_subscription_lifecycle_jobs)
+                    if (
+                        lifecycle_result.get("expirations", {}).get("expired", 0) > 0
+                        or lifecycle_result.get("reminders", {}).get("reminders_queued", 0) > 0
+                    ):
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "subscription_lifecycle_cycle",
+                                    "timestamp": utcnow_iso(),
+                                    **lifecycle_result,
+                                },
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                            flush=True,
+                        )
+                except Exception as life_exc:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "subscription_lifecycle_error",
+                                "timestamp": utcnow_iso(),
+                                "error": str(life_exc)[:1000],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
 
         except Exception as exc:
             print(

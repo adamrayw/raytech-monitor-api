@@ -123,6 +123,22 @@ def startup():
                 conn.execute(text("ALTER TABLE email_deliveries ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128) UNIQUE;"))
             except Exception:
                 pass
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS subscription_audit_logs (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        subscription_id INTEGER NOT NULL REFERENCES user_subscriptions(id) ON DELETE CASCADE,
+                        previous_plan VARCHAR(32) NOT NULL,
+                        new_plan VARCHAR(32) NOT NULL,
+                        event_type VARCHAR(64) NOT NULL,
+                        reason VARCHAR(255),
+                        payment_transaction_id INTEGER REFERENCES payment_transactions(id) ON DELETE SET NULL,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
+            except Exception:
+                pass
             conn.commit()
     except Exception:
         pass
