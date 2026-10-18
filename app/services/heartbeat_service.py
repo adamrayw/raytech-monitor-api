@@ -208,6 +208,10 @@ def evaluate_overdue_heartbeat(db: Session, monitor_id: int) -> bool:
     if not monitor.is_active or monitor.type != "heartbeat" or monitor.status != "healthy":
         return False
 
+    from app.services.subscription_service import get_eligible_resource_ids
+    if monitor.id not in get_eligible_resource_ids(db, monitor.user_id, "heartbeat"):
+        return False
+
     if not monitor.deadline_at:
         return False
 
