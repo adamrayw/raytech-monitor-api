@@ -1,3 +1,4 @@
+import email.utils
 import html
 import json
 import logging
@@ -48,6 +49,30 @@ def get_email_from() -> str:
         "EMAIL_FROM",
         "Raytech Monitor <onboarding@resend.dev>",
     ).strip()
+
+
+def get_billing_email_from() -> str:
+    """Returns the sender address for transactional billing confirmation emails.
+
+    Prefers BILLING_EMAIL_FROM if configured.
+    Safely handles both plain email addresses and display-name formats without
+    ever producing invalid nested brackets (e.g. 'Raytech Billing <Raytech Monitor <addr>>').
+    """
+    configured = os.environ.get("BILLING_EMAIL_FROM", "").strip()
+    if configured:
+        disp, addr = email.utils.parseaddr(configured)
+        if addr and not disp and "<" not in configured:
+            return f"Raytech Billing <{addr}>"
+        return configured
+
+    base_from = get_email_from()
+    display_name, email_address = email.utils.parseaddr(base_from)
+    pure_address = email_address.strip() if email_address else base_from.strip()
+
+    if not pure_address:
+        pure_address = "onboarding@resend.dev"
+
+    return f"Raytech Billing <{pure_address}>"
 
 
 def get_email_reply_to() -> str:
@@ -268,6 +293,171 @@ Manage notification preferences: {settings_link}
     return text_content, html_content
 
 
+def render_payment_confirmation_email(
+    customer_name: str | None,
+    recipient_email: str,
+    transaction_reference: str,
+    amount_idr: int,
+    paid_at: datetime,
+    duration_days: int,
+    expiration_date: datetime | None,
+    payment_channel: str | None = None,
+) -> tuple[str, str]:
+    """Generates both plain-text and responsive HTML for payment confirmation receipts."""
+    frontend_url = get_frontend_url()
+    billing_link = f"{frontend_url}/settings/billing"
+
+    paid_at_str = paid_at.strftime("%d %b %Y, %H:%M UTC")
+    expiry_str = expiration_date.strftime("%d %b %Y, %H:%M UTC") if expiration_date else f"{duration_days} days from payment"
+    channel_str = payment_channel or "Xendit Sandbox Checkout"
+    greeting_name = customer_name.strip() if customer_name and customer_name.strip() else recipient_email
+
+    # Plain-text alternative
+    text_content = f"""Raytech Monitor — Payment Confirmation
+============================================================
+Hello {greeting_name},
+
+Your payment has been successfully processed and confirmed.
+Your Raytech Monitor Pro subscription is now active.
+
+PAYMENT SUMMARY
+------------------------------------------------------------
+Product:             Raytech Monitor Pro
+Plan Duration:       {duration_days} Days
+Amount:              IDR {amount_idr:,}
+Payment Status:      Paid
+Payment Date:        {paid_at_str}
+Payment Method:      {channel_str}
+Order Reference:     {transaction_reference}
+Valid Until:         {expiry_str}
+
+View Billing & Plan:
+{billing_link}
+
+------------------------------------------------------------
+Note: This subscription is a one-time {duration_days}-day access pass and does not automatically renew. No recurring charges will be made to your account.
+
+This email serves as a payment confirmation receipt for your records and is not an official tax invoice.
+"""
+
+    # Escape HTML variables to prevent injection
+    safe_greeting = html.escape(greeting_name)
+    safe_reference = html.escape(transaction_reference)
+    safe_paid_at = html.escape(paid_at_str)
+    safe_expiry = html.escape(expiry_str)
+    safe_channel = html.escape(channel_str)
+    safe_amount = f"IDR {amount_idr:,}"
+    safe_billing_link = html.escape(billing_link)
+
+    # Minimal, high-contrast, brand-aligned transactional HTML email
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Your Raytech Monitor Pro payment is confirmed</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #0c0d0e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #e6edf3; -webkit-font-smoothing: antialiased;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color: #0c0d0e; padding: 32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width: 560px; background-color: #15171a; border: 1px solid #262930; border-radius: 6px; overflow: hidden; text-align: left;">
+          <!-- Brand Header -->
+          <tr>
+            <td style="padding: 24px 28px; border-bottom: 1px solid #22262b; background-color: #0f1113;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                <tr>
+                  <td>
+                    <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.12em; color: #06b6d4; text-transform: uppercase;">RAYTECH MONITOR BILLING</span>
+                    <div style="font-size: 20px; font-weight: 600; color: #f0f6fc; margin-top: 4px;">Payment Confirmed</div>
+                  </td>
+                  <td align="right" valign="middle">
+                    <span style="display: inline-block; padding: 4px 10px; font-size: 11px; font-weight: 600; letter-spacing: 0.05em; color: #22c55e; background-color: rgba(34, 197, 94, 0.12); border: 1px solid #22c55e; border-radius: 3px; text-transform: uppercase;">
+                      PAID
+                    </span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Message Body -->
+          <tr>
+            <td style="padding: 28px;">
+              <p style="margin: 0 0 16px; font-size: 14px; color: #c9d1d9; line-height: 1.5;">
+                Hello <strong style="color: #f0f6fc;">{safe_greeting}</strong>,
+              </p>
+              <p style="margin: 0 0 20px; font-size: 13px; color: #8b949e; line-height: 1.6;">
+                Your payment for <strong style="color: #f0f6fc;">Raytech Monitor Pro</strong> has been successfully processed and verified. Pro features including 1-minute check intervals, 20 HTTP monitors, 20 heartbeats, and SSL alerting are now active.
+              </p>
+
+              <!-- Payment Details Summary Table -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size: 13px; line-height: 1.6; border: 1px solid #22262b; border-radius: 4px; background-color: #0c0d0e; margin-bottom: 24px;">
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e; width: 140px;">Product</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #f0f6fc; font-weight: 600;">Raytech Monitor Pro</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Amount</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #f0f6fc; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-weight: 600;">{safe_amount}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Order Reference</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #06b6d4; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">{safe_reference}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Payment Date</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #c9d1d9;">{safe_paid_at}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Payment Channel</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #c9d1d9; text-transform: uppercase;">{safe_channel}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #8b949e;">Duration</td>
+                  <td style="padding: 12px 16px; border-bottom: 1px solid #1a1e23; color: #c9d1d9;">{duration_days} Days Access</td>
+                </tr>
+                <tr>
+                  <td style="padding: 12px 16px; color: #8b949e;">Valid Until</td>
+                  <td style="padding: 12px 16px; color: #22c55e; font-weight: 500;">{safe_expiry}</td>
+                </tr>
+              </table>
+
+              <!-- Call to Action -->
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom: 24px;">
+                <tr>
+                  <td>
+                    <a href="{safe_billing_link}" target="_blank" style="display: inline-block; background-color: #06b6d4; color: #081014; font-size: 13px; font-weight: 600; text-decoration: none; padding: 11px 20px; border-radius: 4px;">
+                      View Billing &amp; Plan &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Notice on renewal -->
+              <div style="padding: 12px 16px; background-color: #121519; border: 1px solid #22262b; border-radius: 4px; font-size: 11px; color: #8b949e; line-height: 1.5;">
+                <strong style="color: #c9d1d9;">Non-Recurring Access:</strong> Your Pro subscription is a one-time pass and does not automatically debit your card or bank account. You can manually extend your plan at any time from your Billing settings.
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer Disclaimer -->
+          <tr>
+            <td style="padding: 16px 28px; background-color: #0f1113; border-top: 1px solid #22262b; font-size: 11px; color: #6e7681; line-height: 1.5;">
+              This email serves as a payment confirmation receipt for your records and is not an official tax invoice.<br>
+              Raytech Cloud Services &bull; <a href="{safe_billing_link}" target="_blank" style="color: #06b6d4; text-decoration: none;">Account Billing Settings</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+    return text_content, html_content
+
+
 def enqueue_email_for_notification(
     db: Session,
     notification: Notification,
@@ -400,6 +590,65 @@ def enqueue_test_email(
     return delivery
 
 
+def enqueue_payment_confirmation_email(
+    db: Session,
+    user: User,
+    transaction: Any,
+    subscription: Any,
+) -> EmailDelivery | None:
+    """Enqueues an outbox record for payment confirmation receipt.
+
+    Guarantees exactly-once enqueueing per transaction using idempotency key:
+    'payment_confirmed:{transaction.id}'.
+    Does not require monitoring email alerts to be enabled (transactional billing communication).
+    Flushes changes to the session without committing, ensuring caller controls transaction atomicity.
+    """
+    if not user.email:
+        logger.warning(f"Cannot enqueue payment confirmation: user {user.id} has no email address.")
+        return None
+
+    idempotency_key = f"payment_confirmed:{transaction.id}"
+
+    # Check for existing delivery with this idempotency key
+    existing = db.scalar(
+        select(EmailDelivery).where(EmailDelivery.idempotency_key == idempotency_key)
+    )
+    if existing is not None:
+        logger.info(f"Payment confirmation email already enqueued for tx {transaction.id} ({idempotency_key})")
+        return existing
+
+    subject = "Your Raytech Monitor Pro payment is confirmed"
+    text_body, html_body = render_payment_confirmation_email(
+        customer_name=user.name,
+        recipient_email=user.email,
+        transaction_reference=transaction.external_id,
+        amount_idr=transaction.amount,
+        paid_at=transaction.paid_at or utcnow(),
+        duration_days=30,
+        expiration_date=getattr(subscription, "current_period_end", None),
+        payment_channel=transaction.payment_channel or transaction.payment_method,
+    )
+
+    delivery = EmailDelivery(
+        notification_id=None,
+        user_id=user.id,
+        recipient_email=user.email,
+        provider="resend",
+        event_type="payment_confirmed",
+        idempotency_key=idempotency_key,
+        subject=subject,
+        body_text=text_body,
+        body_html=html_body,
+        status="pending",
+        attempt_count=0,
+        next_attempt_at=utcnow(),
+    )
+    db.add(delivery)
+    db.flush()
+    logger.info(f"Enqueued payment confirmation email for user {user.id}, tx {transaction.id} ({idempotency_key})")
+    return delivery
+
+
 def count_recent_sent_emails(
     db: Session,
     user_id: int | None = None,
@@ -419,6 +668,33 @@ def count_recent_sent_emails(
     return db.scalar(stmt) or 0
 
 
+def get_provider_idempotency_key(delivery: EmailDelivery) -> str:
+    """Derives a stable, provider-side idempotency key for Resend API requests.
+
+    Requirements:
+    1. One stable key per logical email event, independent of retry attempts.
+    2. Retries of the same email (e.g. after ambiguous network timeout) must send the
+       exact same idempotency key to prevent duplicate email sends by Resend.
+    3. Distinct transactions produce distinct keys.
+    4. Complies with Resend header formats (alphanumeric, dashes, underscores).
+
+    Note on Provider Guarantees:
+    Provider-side HTTP idempotency retention is typically time-limited (e.g. 24-48 hours
+    on Resend) and cannot mathematically guarantee exactly-once delivery indefinitely.
+    Database-level unique constraints ('idx_email_deliveries_idempotency_key') and the
+    transactional outbox ensure true exactly-once enqueueing within the system.
+    """
+    if getattr(delivery, "idempotency_key", None):
+        slug = (
+            delivery.idempotency_key.replace(":", "-")
+            .replace("_", "-")
+            .replace("/", "-")
+            .strip()
+        )
+        return f"raytech-{slug}"
+    return f"raytech-delivery-{delivery.id}"
+
+
 def send_resend_email_sync(
     delivery: EmailDelivery,
     api_key: str,
@@ -434,10 +710,11 @@ def send_resend_email_sync(
     to_email = target_recipient or delivery.recipient_email
     url = f"{base_url}/emails"
 
+    idemp_key = get_provider_idempotency_key(delivery)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "Idempotency-Key": f"raytech-delivery-{delivery.id}-{delivery.attempt_count}",
+        "Idempotency-Key": idemp_key,
     }
 
     payload = {
@@ -604,12 +881,18 @@ def process_pending_email_deliveries(db: Session | None = None) -> dict:
                     test_recipient,
                 )
 
-            # Perform send
+            # Perform send with appropriate sender identity
+            sender_address = (
+                get_billing_email_from()
+                if delivery.event_type == "payment_confirmed"
+                else from_address
+            )
+
             is_success, status_code, message_id, err_msg = send_resend_email_sync(
                 delivery=delivery,
                 api_key=api_key,
                 base_url=base_url,
-                from_address=from_address,
+                from_address=sender_address,
                 reply_to=reply_to,
                 target_recipient=actual_recipient,
             )

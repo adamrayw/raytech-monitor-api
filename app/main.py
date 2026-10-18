@@ -119,6 +119,10 @@ def startup():
                 conn.execute(text("ALTER TABLE monitors ALTER COLUMN url DROP NOT NULL;"))
             except Exception:
                 pass
+            try:
+                conn.execute(text("ALTER TABLE email_deliveries ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128) UNIQUE;"))
+            except Exception:
+                pass
             conn.commit()
     except Exception:
         pass

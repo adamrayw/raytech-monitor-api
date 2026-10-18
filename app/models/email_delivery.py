@@ -63,6 +63,13 @@ class EmailDelivery(Base):
         nullable=False,
     )
 
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
+
     subject: Mapped[str] = mapped_column(
         String(255),
         nullable=False,

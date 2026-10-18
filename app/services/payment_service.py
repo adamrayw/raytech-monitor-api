@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.payment_transaction import PaymentTransaction
+from app.models.user import User
 from app.services.subscription_service import activate_pro_from_payment, utcnow
 from app.services.xendit_service import (
     PRO_SUBSCRIPTION_AMOUNT_IDR,
@@ -162,7 +163,7 @@ def reconcile_and_process_payment(
         tx.updated_at = now
 
         # Update subscription atomically without committing inside helper
-        activate_pro_from_payment(
+        sub = activate_pro_from_payment(
             db=db,
             user_id=tx.user_id,
             transaction_id=tx.id,
@@ -170,7 +171,18 @@ def reconcile_and_process_payment(
             commit=False,
         )
 
-        # Single atomic database commit for both payment_transactions and user_subscriptions
+        # Enqueue payment confirmation email in the same atomic database transaction
+        user = db.get(User, tx.user_id)
+        if user:
+            from app.services.email_service import enqueue_payment_confirmation_email
+            enqueue_payment_confirmation_email(
+                db=db,
+                user=user,
+                transaction=tx,
+                subscription=sub,
+            )
+
+        # Single atomic database commit for payment_transactions, user_subscriptions, and email_deliveries
         db.commit()
         db.refresh(tx)
         logger.info(f"Authoritative settlement successful: user {tx.user_id} Pro activated via tx {tx.id}")
