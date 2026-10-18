@@ -22,6 +22,7 @@ from app.services.status_page_service import (
     validate_slug,
     verify_user_monitors_ownership,
 )
+from app.services.subscription_service import enforce_status_page_quota
 
 router = APIRouter(prefix="/status-pages", tags=["status-pages"])
 
@@ -122,6 +123,7 @@ def create_status_page(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    enforce_status_page_quota(db, current_user.id)
     cleaned_slug = validate_slug(payload.slug)
 
     # Check globally unique slug

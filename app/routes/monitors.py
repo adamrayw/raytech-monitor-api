@@ -14,6 +14,11 @@ from app.models.heartbeat_event import HeartbeatEvent
 from app.models.incident import Incident
 from app.models.user import User
 from app.services.heartbeat_service import generate_heartbeat_token
+from app.services.subscription_service import (
+    enforce_http_interval,
+    enforce_monitor_creation_quota,
+    enforce_ssl_access,
+)
 from app.schemas.monitor import (
     HeartbeatEventResponse,
     HeartbeatEventsListResponse,
@@ -102,6 +107,7 @@ def create_monitor(
     user: User = Depends(get_current_user),
 ):
     if payload.type == "heartbeat":
+        enforce_monitor_creation_quota(db, user.id, "heartbeat")
         raw_token, token_hash = generate_heartbeat_token()
         monitor = Monitor(
             user_id=user.id,
@@ -128,13 +134,19 @@ def create_monitor(
         resp.heartbeat_token = raw_token
         return resp
 
+    # HTTP monitor creation
+    enforce_monitor_creation_quota(db, user.id, "http")
+    enforce_http_interval(db, user.id, payload.interval_seconds)
+
     url_str = str(payload.url)
     ssl_enabled = payload.ssl_monitoring_enabled
-    if ssl_enabled and not url_str.lower().startswith("https://"):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="SSL monitoring can only be enabled for HTTPS URLs",
-        )
+    if ssl_enabled:
+        enforce_ssl_access(db, user.id)
+        if not url_str.lower().startswith("https://"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="SSL monitoring can only be enabled for HTTPS URLs",
+            )
 
     monitor = Monitor(
         user_id=user.id,
@@ -196,6 +208,14 @@ def update_monitor(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="expected_status_min must be less than or equal to expected_status_max",
         )
+
+    # Entitlement checks on update
+    if "interval_seconds" in updates and updates["interval_seconds"] is not None:
+        if monitor.type == "http":
+            enforce_http_interval(db, user.id, updates["interval_seconds"])
+
+    if "ssl_monitoring_enabled" in updates and updates["ssl_monitoring_enabled"] is True:
+        enforce_ssl_access(db, user.id, existing_monitor=monitor)
 
     new_url = updates.get("url")
     effective_url = str(new_url) if new_url is not None else monitor.url

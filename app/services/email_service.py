@@ -293,6 +293,10 @@ def enqueue_email_for_notification(
     if pref is None or not pref.email_enabled:
         return None
 
+    from app.services.subscription_service import is_user_email_entitled
+    if not is_user_email_entitled(db, user.id):
+        return None
+
     if not is_event_enabled_for_user(pref, notification.event_type):
         return None
 

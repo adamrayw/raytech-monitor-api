@@ -17,6 +17,7 @@ from app.dependencies.auth import get_current_user
 from app.main import app
 from app.models.user import User
 from app.models.monitor import Monitor
+from app.models.subscription import UserSubscription
 
 
 @pytest.fixture(scope="session")
@@ -55,6 +56,17 @@ def test_user(db):
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    # Pre-v0.7 grandfathered user for legacy regression tests
+    sub = UserSubscription(
+        user_id=user.id,
+        plan="free",
+        status="active",
+        legacy_override=True,
+        override_reason="pre_v0.7_legacy_grandfathered",
+    )
+    db.add(sub)
+    db.commit()
     return user
 
 

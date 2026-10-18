@@ -21,6 +21,7 @@ from app.services.email_service import (
     is_email_enabled,
     is_test_mode,
 )
+from app.services.subscription_service import enforce_email_access
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -97,6 +98,9 @@ def update_notification_settings(
     pref = get_or_create_preferences(db, current_user.id)
 
     update_data = payload.model_dump(exclude_unset=True)
+    if update_data.get("email_enabled") is True and not pref.email_enabled:
+        enforce_email_access(db, current_user.id)
+
     for field, value in update_data.items():
         if value is not None and hasattr(pref, field):
             setattr(pref, field, value)
@@ -132,6 +136,8 @@ def send_test_email(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    enforce_email_access(db, current_user.id)
+
     if not is_email_enabled():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

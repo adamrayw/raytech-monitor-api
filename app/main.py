@@ -16,6 +16,7 @@ from app.routes.heartbeat import router as heartbeat_router
 from app.routes.settings import router as settings_router
 from app.routes.status_pages import router as status_pages_router
 from app.routes.public_status import router as public_status_router
+from app.routes.subscription import router as subscription_router
 
 app = FastAPI(
     title="Raytech Monitor API",
@@ -72,6 +73,24 @@ def startup():
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMP WITH TIME ZONE;"))
             conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS heartbeat_token_hash VARCHAR(64);"))
             conn.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution_reason VARCHAR(64);"))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_subscriptions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    plan VARCHAR(32) NOT NULL DEFAULT 'free',
+                    status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    current_period_start TIMESTAMP WITH TIME ZONE,
+                    current_period_end TIMESTAMP WITH TIME ZONE,
+                    cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE,
+                    legacy_override BOOLEAN NOT NULL DEFAULT FALSE,
+                    override_reason VARCHAR(128),
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+            conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS legacy_override BOOLEAN NOT NULL DEFAULT FALSE;"))
+            conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS override_reason VARCHAR(128);"))
             try:
                 conn.execute(text("ALTER TABLE monitors ALTER COLUMN url DROP NOT NULL;"))
             except Exception:
@@ -89,6 +108,7 @@ app.include_router(heartbeat_router)
 app.include_router(settings_router)
 app.include_router(status_pages_router)
 app.include_router(public_status_router)
+app.include_router(subscription_router)
 
 @app.get("/")
 def root():
