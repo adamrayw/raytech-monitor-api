@@ -283,6 +283,12 @@ def startup():
     except Exception as exc:
         logger.warning(f"Xendit environment check: {exc}")
 
+    try:
+        from app.services.duitku_service import validate_duitku_environment
+        validate_duitku_environment()
+    except Exception as exc:
+        logger.warning(f"Duitku environment check: {exc}")
+
 
 app.include_router(monitors_router)
 app.include_router(incidents_router)

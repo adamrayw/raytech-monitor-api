@@ -8,6 +8,11 @@ from sqlalchemy.orm import Session
 
 from app.models.payment_transaction import PaymentTransaction
 from app.models.user import User
+from app.services.duitku_service import (
+    DuitkuApiError,
+    DuitkuConfigurationError,
+    get_duitku_transaction_status,
+)
 from app.services.subscription_service import activate_pro_from_payment, utcnow
 from app.services.xendit_service import (
     PRO_SUBSCRIPTION_AMOUNT_IDR,
@@ -53,9 +58,9 @@ def reconcile_and_process_payment(
     Acquires a pessimistic database row lock (`with_for_update()`) to prevent race
     conditions between concurrent webhook deliveries and user polling.
 
-    Authoritatively queries Xendit's authenticated API to verify payment proof,
-    preventing any spoofing or forged webhook payloads. Updates transaction status
-    and activates Pro entitlements in a single atomic commit.
+    Authoritatively queries the respective provider's (Duitku or Xendit) authenticated API
+    to verify payment proof, preventing any spoofing or forged webhook payloads.
+    Updates transaction status and activates Pro entitlements in a single atomic commit.
     """
     # 1. Pessimistic lock on the transaction row
     tx = db.scalar(
@@ -94,6 +99,93 @@ def reconcile_and_process_payment(
             detail={"error": "Invoice ID mismatch"},
         )
 
+    # --- DUITKU RECONCILIATION PATH ---
+    if tx.provider == "duitku":
+        target_order_id = tx.external_id
+        status_data = get_duitku_transaction_status(target_order_id)
+
+        authoritative_order_id = str(status_data.get("merchantOrderId", "")).strip()
+        if authoritative_order_id != tx.external_id:
+            logger.error(f"Duitku authoritative order ID mismatch: expected {tx.external_id}, got {authoritative_order_id}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Authoritative merchantOrderId mismatch"},
+            )
+
+        try:
+            authoritative_amount = int(float(status_data.get("amount", 0)))
+        except (ValueError, TypeError):
+            authoritative_amount = 0
+
+        if authoritative_amount != PRO_SUBSCRIPTION_AMOUNT_IDR:
+            logger.error(f"Duitku authoritative amount mismatch on tx {tx.id}: expected {PRO_SUBSCRIPTION_AMOUNT_IDR}, got {authoritative_amount}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": f"Amount must be IDR {PRO_SUBSCRIPTION_AMOUNT_IDR}"},
+            )
+
+        duitku_status_code = str(status_data.get("statusCode", "")).strip()
+
+        if duitku_status_code == "00":  # Success
+            allowed = VALID_TRANSITIONS.get(tx.status, set())
+            if "PAID" not in allowed:
+                logger.warning(f"Disallowed state transition from {tx.status} to PAID for tx {tx.id}")
+                return "invalid_transition", tx
+
+            now = utcnow()
+            tx.status = "PAID"
+            tx.provider_payment_id = status_data.get("reference") or tx.provider_payment_id
+            tx.payment_method = (webhook_payload.get("paymentCode") if webhook_payload else None) or tx.payment_method or "QRIS"
+            tx.payment_channel = "duitku"
+            tx.paid_at = now
+            tx.updated_at = now
+
+            sub = activate_pro_from_payment(
+                db=db,
+                user_id=tx.user_id,
+                transaction_id=tx.id,
+                duration_days=PRO_SUBSCRIPTION_DURATION_DAYS,
+                commit=False,
+            )
+
+            user = db.get(User, tx.user_id)
+            if user:
+                from app.services.email_service import enqueue_payment_confirmation_email
+                enqueue_payment_confirmation_email(
+                    db=db,
+                    user=user,
+                    transaction=tx,
+                    subscription=sub,
+                )
+
+            db.commit()
+            db.refresh(tx)
+            logger.info(f"Duitku authoritative settlement successful: user {tx.user_id} Pro activated via tx {tx.id}")
+            return "activated", tx
+
+        elif duitku_status_code in ("02", "FAILED", "CANCELED"):
+            if tx.status == "PENDING":
+                tx.status = "FAILED"
+                tx.updated_at = utcnow()
+                db.commit()
+                db.refresh(tx)
+            return "failed", tx
+
+        elif duitku_status_code == "01":  # Pending
+            if webhook_payload and (
+                str(webhook_payload.get("resultCode", "")) == "00"
+                or str(webhook_payload.get("status", "")).upper() in ("PAID", "SETTLED")
+            ):
+                logger.warning(f"Forged PAID webhook for Duitku tx {tx.id}: authoritative status is still PENDING")
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"error": "Authoritative invoice status is still PENDING"},
+                )
+            return "pending", tx
+
+        return "unhandled", tx
+
+    # --- XENDIT RECONCILIATION PATH ---
     # 4. Determine target provider invoice ID
     target_invoice_id = tx.provider_payment_id or expected_invoice_id
     if not target_invoice_id:
@@ -104,7 +196,6 @@ def reconcile_and_process_payment(
         )
 
     # 5. Authoritatively retrieve invoice from Xendit's authenticated API
-    # Propagates XenditApiError (502/504) if Xendit is unreachable, causing webhook to fail retryably
     invoice = get_xendit_invoice(target_invoice_id)
 
     # 6. Authoritative Invoice Identity & Data Integrity Verification
@@ -148,7 +239,6 @@ def reconcile_and_process_payment(
 
     # 7. State Machine Execution & Atomic Transaction Commit
     if authoritative_status in ("PAID", "SETTLED"):
-        # Verify valid transition
         allowed = VALID_TRANSITIONS.get(tx.status, set())
         if "PAID" not in allowed:
             logger.warning(f"Disallowed state transition from {tx.status} to PAID for tx {tx.id}")
@@ -162,7 +252,6 @@ def reconcile_and_process_payment(
         tx.paid_at = parse_iso_datetime(invoice.get("paid_at")) or now
         tx.updated_at = now
 
-        # Update subscription atomically without committing inside helper
         sub = activate_pro_from_payment(
             db=db,
             user_id=tx.user_id,
@@ -171,7 +260,6 @@ def reconcile_and_process_payment(
             commit=False,
         )
 
-        # Enqueue payment confirmation email in the same atomic database transaction
         user = db.get(User, tx.user_id)
         if user:
             from app.services.email_service import enqueue_payment_confirmation_email
@@ -182,7 +270,6 @@ def reconcile_and_process_payment(
                 subscription=sub,
             )
 
-        # Single atomic database commit for payment_transactions, user_subscriptions, and email_deliveries
         db.commit()
         db.refresh(tx)
         logger.info(f"Authoritative settlement successful: user {tx.user_id} Pro activated via tx {tx.id}")
@@ -205,7 +292,6 @@ def reconcile_and_process_payment(
         return "failed", tx
 
     elif authoritative_status == "PENDING":
-        # If incoming webhook payload forged PAID but authoritative status is PENDING, reject
         if webhook_payload and str(webhook_payload.get("status", "")).upper() in ("PAID", "SETTLED"):
             logger.warning(f"Forged PAID webhook for tx {tx.id}: authoritative invoice is still PENDING")
             raise HTTPException(
@@ -215,3 +301,4 @@ def reconcile_and_process_payment(
         return "pending", tx
 
     return "unhandled", tx
+

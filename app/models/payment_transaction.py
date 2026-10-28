@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -28,6 +28,14 @@ class PaymentTransaction(Base):
     provider: Mapped[str] = mapped_column(
         String(32),
         default="xendit",
+        index=True,
+        nullable=False,
+    )
+
+    provider_mode: Mapped[str] = mapped_column(
+        String(32),
+        default="sandbox",
+        index=True,
         nullable=False,
     )
 
@@ -86,6 +94,11 @@ class PaymentTransaction(Base):
 
     checkout_url: Mapped[str | None] = mapped_column(
         String(512),
+        nullable=True,
+    )
+
+    qr_string: Mapped[str | None] = mapped_column(
+        Text,
         nullable=True,
     )
 
