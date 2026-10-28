@@ -127,6 +127,168 @@ def generate_check_transaction_signature(merchant_code: str, merchant_order_id: 
     ).hexdigest()
 
 
+def generate_payment_methods_signature(
+    merchant_code: str, amount: int, datetime_str: str, api_key: str
+) -> str:
+    """Generates official HMAC-SHA256 signature for Duitku getpaymentmethod request:
+    Formula: HMAC_SHA256(merchantCode + amount + datetime, apiKey)
+    """
+    string_to_sign = f"{merchant_code}{amount}{datetime_str}"
+    return hmac.new(
+        api_key.encode("utf-8"),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def categorize_duitku_method(code: str, name: str) -> tuple[str, str]:
+    """Categorizes a Duitku payment method code and name into a standardized category.
+    Returns (category_key, category_label).
+    """
+    code_upper = (code or "").strip().upper()
+    name_upper = (name or "").strip().upper()
+
+    if "QRIS" in name_upper or "QR" in name_upper or code_upper in ("SP", "NQ", "LQ"):
+        return "qr", "QR Payment"
+    elif (
+        "VA" in name_upper
+        or "VIRTUAL ACCOUNT" in name_upper
+        or code_upper in ("BC", "M1", "M2", "B1", "NC", "BR", "BT", "A1", "VA", "B2", "AG", "HN")
+    ):
+        return "virtual_account", "Virtual Account"
+    elif (
+        any(w in name_upper for w in ("DANA", "OVO", "SHOPEEPAY", "LINKAJA", "GOPAY", "ASTRAPAY", "WALLET"))
+        or code_upper in ("OV", "DA", "SA", "LF", "OL")
+    ):
+        return "ewallet", "E-Wallet"
+    elif (
+        any(w in name_upper for w in ("CARD", "VISA", "MASTERCARD", "JCB"))
+        or code_upper in ("VC", "CC")
+    ):
+        return "card", "Credit / Debit Card"
+    elif (
+        any(w in name_upper for w in ("INDOMARET", "ALFAMART", "POS", "PEGADAIAN", "RETAIL"))
+        or code_upper in ("IR", "AL", "FT")
+    ):
+        return "retail", "Retail Outlet"
+    elif (
+        any(w in name_upper for w in ("PAYLATER", "KREDIVO", "AKULAKU", "INDODANA"))
+        or code_upper in ("KL", "ID")
+    ):
+        return "paylater", "PayLater"
+    else:
+        return "other", "Lainnya"
+
+
+_PAYMENT_METHODS_CACHE: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
+PAYMENT_METHODS_CACHE_TTL = 60.0  # seconds
+
+
+def clear_payment_methods_cache() -> None:
+    """Clears in-memory payment methods cache (for tests/invalidation)."""
+    global _PAYMENT_METHODS_CACHE
+    _PAYMENT_METHODS_CACHE.clear()
+
+
+def get_duitku_payment_methods(amount: int = PRO_SUBSCRIPTION_AMOUNT_IDR) -> list[dict[str, Any]]:
+    """Fetches and normalizes available payment methods for the active merchant/environment.
+
+    Utilizes official Duitku getpaymentmethod API:
+    https://sandbox.duitku.com/webapi/api/merchant/paymentmethod/getpaymentmethod
+    Caches results in-memory for 60 seconds per (mode, amount).
+    """
+    import time
+
+    mode = get_duitku_mode()
+    cache_key = (mode, amount)
+    now = time.time()
+
+    if cache_key in _PAYMENT_METHODS_CACHE:
+        cached_time, cached_methods = _PAYMENT_METHODS_CACHE[cache_key]
+        if now - cached_time < PAYMENT_METHODS_CACHE_TTL:
+            return cached_methods
+
+    merchant_code = get_duitku_merchant_code()
+    api_key = get_duitku_api_key()
+
+    if not merchant_code or not api_key:
+        raise DuitkuConfigurationError("Payment gateway credentials are not configured on the server.")
+
+    base_url = get_duitku_base_url()
+    endpoint = f"{base_url}/webapi/api/merchant/paymentmethod/getpaymentmethod"
+
+    dt_str = utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    signature = generate_payment_methods_signature(
+        merchant_code=merchant_code,
+        amount=amount,
+        datetime_str=dt_str,
+        api_key=api_key,
+    )
+
+    payload = {
+        "merchantcode": merchant_code,
+        "amount": str(amount),
+        "datetime": dt_str,
+        "signature": signature,
+    }
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                endpoint,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+    except httpx.TimeoutException as exc:
+        logger.error(f"Timeout fetching Duitku payment methods: {exc}")
+        raise DuitkuApiError("Payment gateway timed out. Please try again later.", status_code=504)
+    except httpx.RequestError as exc:
+        logger.error(f"Network error fetching Duitku payment methods: {exc}")
+        raise DuitkuApiError("Unable to connect to payment gateway. Please try again later.", status_code=502)
+
+    if resp.status_code >= 400:
+        logger.error(f"Duitku paymentmethod returned HTTP {resp.status_code}: {resp.text}")
+        raise DuitkuApiError("Payment gateway returned an error fetching payment methods.", status_code=resp.status_code)
+
+    data = resp.json()
+    resp_code = str(data.get("responseCode", "")).strip()
+    if resp_code != "00":
+        msg = data.get("responseMessage") or f"Duitku getpaymentmethod returned non-success code: {resp_code}"
+        logger.error(f"Duitku getpaymentmethod error: {data}")
+        raise DuitkuApiError(msg, status_code=422, data=data)
+
+    raw_methods = data.get("paymentFee") or []
+    normalized: list[dict[str, Any]] = []
+
+    for item in raw_methods:
+        code = str(item.get("paymentMethod", "")).strip()
+        name = str(item.get("paymentName", "")).strip()
+        if not code or not name:
+            continue
+
+        raw_fee = item.get("totalFee", 0)
+        try:
+            fee_int = int(float(raw_fee))
+        except (ValueError, TypeError):
+            fee_int = 0
+
+        cat_key, cat_label = categorize_duitku_method(code, name)
+
+        normalized.append({
+            "code": code,
+            "name": name,
+            "category": cat_key,
+            "category_label": cat_label,
+            "fee": fee_int,
+            "total_amount": amount + fee_int,
+            "image_url": item.get("paymentImage") or None,
+            "active": True,
+        })
+
+    _PAYMENT_METHODS_CACHE[cache_key] = (now, normalized)
+    return normalized
+
+
 def verify_duitku_callback_signature(
     merchant_code: str,
     amount: Any,

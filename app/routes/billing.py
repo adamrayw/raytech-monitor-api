@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -21,6 +21,7 @@ from app.services.duitku_service import (
     generate_duitku_order_id,
     get_duitku_api_key,
     get_duitku_mode,
+    get_duitku_payment_methods,
     is_user_allowed_sandbox_checkout,
 )
 from app.services.payment_service import reconcile_and_process_payment
@@ -35,6 +36,59 @@ from app.services.subscription_service import (
 logger = logging.getLogger("raytech.billing")
 
 router = APIRouter(prefix="/billing", tags=["billing"])
+
+
+@router.get("/payment-methods", summary="List available payment methods from gateway")
+def list_payment_methods(
+    amount: int = Query(default=PRO_SUBSCRIPTION_AMOUNT_IDR, description="Transaction amount in IDR"),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Returns the list of available payment methods for the active Duitku merchant.
+    Categories are derived from active methods only. Safe public data only.
+    """
+    api_rate_limiter.check_or_raise(
+        f"billing_methods:{current_user.id}",
+        max_requests=60,
+        window_seconds=60.0,
+        error_detail="Too many payment method requests. Please wait before refreshing.",
+    )
+    enforced_amount = PRO_SUBSCRIPTION_AMOUNT_IDR
+    try:
+        methods = get_duitku_payment_methods(amount=enforced_amount)
+    except DuitkuConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "GATEWAY_CONFIG_ERROR", "message": str(exc)},
+        )
+    except DuitkuApiError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "GATEWAY_API_ERROR", "message": str(exc)},
+        )
+
+    # Derive unique ordered categories that have at least one active method
+    seen_cats = set()
+    categories = []
+    category_order = ["virtual_account", "ewallet", "qr", "card", "retail", "paylater", "other"]
+    methods_by_cat = {m["category"]: m["category_label"] for m in methods}
+
+    for cat_key in category_order:
+        if cat_key in methods_by_cat and cat_key not in seen_cats:
+            seen_cats.add(cat_key)
+            categories.append({"key": cat_key, "label": methods_by_cat[cat_key]})
+
+    for cat_key, cat_label in methods_by_cat.items():
+        if cat_key not in seen_cats:
+            seen_cats.add(cat_key)
+            categories.append({"key": cat_key, "label": cat_label})
+
+    return {
+        "payment_methods": methods,
+        "categories": categories,
+        "provider_mode": get_duitku_mode(),
+        "base_amount": enforced_amount,
+        "currency": "IDR",
+    }
 
 
 class CheckoutRequest(BaseModel):
@@ -108,8 +162,26 @@ def create_checkout_session(
             },
         )
 
-    # 1. Idempotency protection against rapid repeated clicks:
-    # If a pending transaction exists created within last 15 minutes for Duitku with a valid checkout_url, reuse it.
+    # 1. Validate requested payment method against active Duitku methods
+    requested_method = (payload.payment_method or "SP").strip()
+    try:
+        available_methods = get_duitku_payment_methods(amount=PRO_SUBSCRIPTION_AMOUNT_IDR)
+        active_codes = {m["code"] for m in available_methods if m.get("active", True)}
+        if active_codes and requested_method not in active_codes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "PAYMENT_METHOD_UNAVAILABLE",
+                    "message": f"Payment method '{requested_method}' is currently not available for this merchant.",
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(f"Could not pre-validate payment method availability with Duitku: {exc}")
+
+    # 2. Idempotency protection against rapid repeated clicks:
+    # If a pending transaction exists created within last 15 minutes for Duitku with same payment method and valid checkout_url, reuse it.
     fifteen_mins_ago = utcnow() - timedelta(minutes=15)
     existing_pending = db.scalar(
         select(PaymentTransaction)
@@ -117,6 +189,10 @@ def create_checkout_session(
             PaymentTransaction.user_id == current_user.id,
             PaymentTransaction.status == "PENDING",
             PaymentTransaction.provider == "duitku",
+            or_(
+                PaymentTransaction.payment_method == requested_method,
+                PaymentTransaction.payment_method.is_(None) if requested_method == "SP" else False,
+            ),
             PaymentTransaction.created_at >= fifteen_mins_ago,
             PaymentTransaction.checkout_url.isnot(None),
         )
@@ -125,13 +201,16 @@ def create_checkout_session(
     )
 
     if existing_pending and existing_pending.checkout_url:
-        logger.info(f"Reusing active pending checkout tx {existing_pending.id} for user {current_user.id} (duitku)")
+        logger.info(f"Reusing active pending checkout tx {existing_pending.id} for user {current_user.id} ({requested_method})")
         return {
             "transaction_id": existing_pending.id,
             "external_id": existing_pending.external_id,
             "provider": existing_pending.provider,
             "provider_mode": existing_pending.provider_mode,
+            "payment_method": existing_pending.payment_method,
+            "payment_channel": existing_pending.payment_channel,
             "checkout_url": existing_pending.checkout_url,
+            "va_number": getattr(existing_pending, "va_number", None),
             "qr_string": existing_pending.qr_string,
             "amount": existing_pending.amount,
             "currency": existing_pending.currency,
@@ -139,11 +218,11 @@ def create_checkout_session(
             "expires_at": existing_pending.expires_at.isoformat() if existing_pending.expires_at else None,
         }
 
-    # 2. Determine mode and unique external order reference
+    # 3. Determine mode and unique external order reference
     external_id = generate_duitku_order_id(current_user.id)
     provider_mode = get_duitku_mode()
 
-    # 3. Create local pending transaction record
+    # 4. Create local pending transaction record
     tx = PaymentTransaction(
         user_id=current_user.id,
         plan=PRO_PLAN_ID,
@@ -152,6 +231,7 @@ def create_checkout_session(
         status="PENDING",
         provider="duitku",
         provider_mode=provider_mode,
+        payment_method=requested_method,
         external_id=external_id,
         created_at=utcnow(),
         updated_at=utcnow(),
@@ -160,14 +240,14 @@ def create_checkout_session(
     db.commit()
     db.refresh(tx)
 
-    # 4. Initiate provider checkout via Duitku
+    # 5. Initiate provider checkout via Duitku
     try:
         data = create_duitku_transaction(
             merchant_order_id=tx.external_id,
             amount=tx.amount,
             payer_email=current_user.email,
             customer_name=current_user.name or "Raytech Subscriber",
-            payment_method=payload.payment_method or "SP",
+            payment_method=requested_method,
         )
     except DuitkuConfigurationError as exc:
         tx.status = "FAILED"
@@ -187,7 +267,8 @@ def create_checkout_session(
     tx.provider_payment_id = data.get("reference")
     tx.checkout_url = data.get("paymentUrl")
     tx.qr_string = data.get("qrString")
-    tx.payment_method = payload.payment_method or "SP"
+    tx.va_number = data.get("vaNumber")
+    tx.payment_method = requested_method
     tx.payment_channel = "duitku"
     tx.expires_at = utcnow() + timedelta(hours=24)
     tx.updated_at = utcnow()
@@ -199,7 +280,10 @@ def create_checkout_session(
         "external_id": tx.external_id,
         "provider": tx.provider,
         "provider_mode": tx.provider_mode,
+        "payment_method": tx.payment_method,
+        "payment_channel": tx.payment_channel,
         "checkout_url": tx.checkout_url,
+        "va_number": tx.va_number,
         "qr_string": tx.qr_string,
         "amount": tx.amount,
         "currency": tx.currency,
@@ -248,6 +332,7 @@ def list_user_transactions(
             "payment_method": tx.payment_method,
             "payment_channel": tx.payment_channel,
             "checkout_url": tx.checkout_url,
+            "va_number": getattr(tx, "va_number", None),
             "qr_string": tx.qr_string,
             "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
             "paid_at": tx.paid_at.isoformat() if tx.paid_at else None,
@@ -290,6 +375,7 @@ def get_transaction_detail(
         "payment_method": tx.payment_method,
         "payment_channel": tx.payment_channel,
         "checkout_url": tx.checkout_url,
+        "va_number": getattr(tx, "va_number", None),
         "qr_string": tx.qr_string,
         "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
         "paid_at": tx.paid_at.isoformat() if tx.paid_at else None,
@@ -363,7 +449,10 @@ def get_transaction_status(
         "plan": tx.plan,
         "amount": tx.amount,
         "currency": tx.currency,
+        "payment_method": tx.payment_method,
+        "payment_channel": tx.payment_channel,
         "checkout_url": tx.checkout_url,
+        "va_number": getattr(tx, "va_number", None),
         "qr_string": tx.qr_string,
         "paid_at": tx.paid_at.isoformat() if tx.paid_at else None,
         "is_pro_active": effective_plan == PRO_PLAN_ID,

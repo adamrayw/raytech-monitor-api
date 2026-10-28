@@ -258,6 +258,12 @@ def startup():
             except Exception:
                 pass
             try:
+                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS va_number VARCHAR(64);"))
+                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS qr_string TEXT;"))
+                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS provider_mode VARCHAR(32) NOT NULL DEFAULT 'sandbox';"))
+            except Exception:
+                pass
+            try:
                 conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS subscription_audit_logs (
                         id SERIAL PRIMARY KEY,

@@ -18,13 +18,17 @@ from app.services.duitku_service import (
     PRO_SUBSCRIPTION_DURATION_DAYS,
     DuitkuApiError,
     DuitkuConfigurationError,
+    categorize_duitku_method,
+    clear_payment_methods_cache,
     create_duitku_transaction,
     generate_check_transaction_signature,
     generate_duitku_order_id,
     generate_inquiry_signature,
+    generate_payment_methods_signature,
     get_duitku_api_key,
     get_duitku_merchant_code,
     get_duitku_mode,
+    get_duitku_payment_methods,
     get_duitku_transaction_status,
     verify_duitku_callback_signature,
 )
@@ -777,4 +781,239 @@ def test_subscription_extension_duration_matrix(db):
     expected_end_c = utcnow() + timedelta(days=30)
     diff_c = abs((ensure_utc(sub_c.current_period_end) - expected_end_c).total_seconds())
     assert diff_c < 5.0
+
+
+# =========================================================================
+# 6. Multi-Payment Gateway Discovery & Checkout Tests
+# =========================================================================
+
+def test_payment_methods_signature_computation():
+    """Verify HMAC-SHA256 signature calculation for Duitku getpaymentmethod."""
+    sig = generate_payment_methods_signature(
+        merchant_code=TEST_MERCHANT_CODE,
+        amount=49000,
+        datetime_str="2026-10-29 12:00:00",
+        api_key=TEST_API_KEY,
+    )
+    expected = hmac.new(
+        TEST_API_KEY.encode("utf-8"),
+        f"{TEST_MERCHANT_CODE}490002026-10-29 12:00:00".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert sig == expected
+
+
+def test_categorize_duitku_method():
+    """Test channel classification into user-friendly categories."""
+    assert categorize_duitku_method("BC", "BCA Virtual Account")[0] == "virtual_account"
+    assert categorize_duitku_method("M1", "Mandiri VA")[0] == "virtual_account"
+    assert categorize_duitku_method("SP", "ShopeePay QRIS")[0] == "qr"
+    assert categorize_duitku_method("NQ", "Nobu QRIS")[0] == "qr"
+    assert categorize_duitku_method("DA", "DANA")[0] == "ewallet"
+    assert categorize_duitku_method("OV", "OVO")[0] == "ewallet"
+    assert categorize_duitku_method("VC", "Credit Card")[0] == "card"
+    assert categorize_duitku_method("IR", "Indomaret")[0] == "retail"
+    assert categorize_duitku_method("KL", "Kredivo")[0] == "paylater"
+    assert categorize_duitku_method("ZZ", "Unknown Special")[0] == "other"
+
+
+def test_get_payment_methods_success_and_caching(duitku_client):
+    """GET /billing/payment-methods normalizes Duitku methods, omits secrets, and caches results."""
+    clear_payment_methods_cache()
+
+    mock_raw_methods = {
+        "paymentFee": [
+            {
+                "paymentMethod": "BC",
+                "paymentName": "BCA Virtual Account",
+                "paymentImage": "https://images.duitku.com/hotlink-ok/BC.PNG",
+                "totalFee": "0",
+            },
+            {
+                "paymentMethod": "SP",
+                "paymentName": "ShopeePay QRIS",
+                "paymentImage": "https://images.duitku.com/hotlink-ok/SP.PNG",
+                "totalFee": "0",
+            },
+            {
+                "paymentMethod": "DA",
+                "paymentName": "DANA",
+                "paymentImage": "https://images.duitku.com/hotlink-ok/DA.PNG",
+                "totalFee": "1000",
+            },
+        ],
+        "responseCode": "00",
+        "responseMessage": "SUCCESS",
+    }
+
+    with patch("httpx.Client.post") as mock_post:
+        import httpx
+        mock_resp = httpx.Response(200, json=mock_raw_methods, request=httpx.Request("POST", "http://test"))
+        mock_post.return_value = mock_resp
+
+        # First request: fetches from provider
+        res = duitku_client.get("/billing/payment-methods")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["provider_mode"] == "sandbox"
+        assert data["base_amount"] == 49000
+        assert data["currency"] == "IDR"
+
+        # Check normalization
+        methods = data["payment_methods"]
+        assert len(methods) == 3
+        bca = next(m for m in methods if m["code"] == "BC")
+        assert bca["name"] == "BCA Virtual Account"
+        assert bca["category"] == "virtual_account"
+        assert bca["fee"] == 0
+        assert bca["total_amount"] == 49000
+        assert bca["image_url"] == "https://images.duitku.com/hotlink-ok/BC.PNG"
+        assert bca["active"] is True
+
+        dana = next(m for m in methods if m["code"] == "DA")
+        assert dana["category"] == "ewallet"
+        assert dana["fee"] == 1000
+        assert dana["total_amount"] == 50000
+
+        # Check categories
+        cat_keys = [c["key"] for c in data["categories"]]
+        assert "virtual_account" in cat_keys
+        assert "qr" in cat_keys
+        assert "ewallet" in cat_keys
+
+        # Verify secrets are NOT leaked
+        raw_text = res.text
+        assert TEST_API_KEY not in raw_text
+        assert "signature" not in raw_text
+
+        # Second request: served from cache (mock_post not called again)
+        call_count_before = mock_post.call_count
+        res2 = duitku_client.get("/billing/payment-methods")
+        assert res2.status_code == 200
+        assert mock_post.call_count == call_count_before
+
+
+def test_get_payment_methods_gateway_failure_handled_gracefully(duitku_client):
+    """When Duitku payment methods API times out or fails, API responds with 502/504."""
+    clear_payment_methods_cache()
+    with patch("httpx.Client.post", side_effect=DuitkuApiError("Connection timeout", status_code=504)):
+        res = duitku_client.get("/billing/payment-methods")
+        assert res.status_code == 502
+        assert res.json()["detail"]["code"] == "GATEWAY_API_ERROR"
+
+
+def test_checkout_with_virtual_account(db, duitku_user, duitku_client):
+    """User checks out with BCA Virtual Account; returns va_number and persists in DB."""
+    mock_methods = [
+        {"code": "BC", "name": "BCA VA", "category": "virtual_account", "category_label": "Virtual Account", "active": True}
+    ]
+    mock_inquiry_resp = {
+        "statusCode": "00",
+        "statusMessage": "SUCCESS",
+        "reference": "DTK_REF_BCA_VA_1",
+        "paymentUrl": "https://sandbox.duitku.com/pay_va",
+        "vaNumber": "7007014001444348",
+        "amount": "49000",
+    }
+
+    with patch("app.routes.billing.get_duitku_payment_methods", return_value=mock_methods):
+        with patch("app.routes.billing.create_duitku_transaction", return_value=mock_inquiry_resp):
+            res = duitku_client.post(
+                "/billing/checkout",
+                json={"plan": "pro", "provider": "duitku", "payment_method": "BC"},
+            )
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "PENDING"
+            assert data["payment_method"] == "BC"
+            assert data["va_number"] == "7007014001444348"
+            assert data["qr_string"] is None
+
+            tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == data["transaction_id"]))
+            assert tx is not None
+            assert tx.payment_method == "BC"
+            assert tx.va_number == "7007014001444348"
+            assert tx.status == "PENDING"
+            assert tx.paid_at is None
+
+            # Verify Pro not activated yet
+            plan, _ = get_effective_plan(db, duitku_user.id)
+            assert plan == "free"
+
+
+def test_checkout_with_ewallet(db, duitku_user, duitku_client):
+    """User checks out with DANA E-Wallet; returns checkout_url without va_number."""
+    mock_methods = [
+        {"code": "DA", "name": "DANA", "category": "ewallet", "category_label": "E-Wallet", "active": True}
+    ]
+    mock_inquiry_resp = {
+        "statusCode": "00",
+        "statusMessage": "SUCCESS",
+        "reference": "DTK_REF_DANA_1",
+        "paymentUrl": "https://sandbox.duitku.com/topup/dana_checkout",
+        "amount": "49000",
+    }
+
+    with patch("app.routes.billing.get_duitku_payment_methods", return_value=mock_methods):
+        with patch("app.routes.billing.create_duitku_transaction", return_value=mock_inquiry_resp):
+            res = duitku_client.post(
+                "/billing/checkout",
+                json={"plan": "pro", "provider": "duitku", "payment_method": "DA"},
+            )
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "PENDING"
+            assert data["payment_method"] == "DA"
+            assert data["checkout_url"] == "https://sandbox.duitku.com/topup/dana_checkout"
+            assert data["va_number"] is None
+
+            tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == data["transaction_id"]))
+            assert tx is not None
+            assert tx.payment_method == "DA"
+            assert tx.status == "PENDING"
+
+
+def test_checkout_with_unsupported_payment_method_rejected(duitku_client):
+    """Attempting checkout with an unactivated or disabled payment method is rejected with 400."""
+    mock_methods = [
+        {"code": "SP", "name": "ShopeePay QRIS", "category": "qr", "active": True},
+        {"code": "BC", "name": "BCA VA", "category": "virtual_account", "active": True},
+    ]
+
+    with patch("app.routes.billing.get_duitku_payment_methods", return_value=mock_methods):
+        res = duitku_client.post(
+            "/billing/checkout",
+            json={"plan": "pro", "provider": "duitku", "payment_method": "UNAVAILABLE_CODE"},
+        )
+        assert res.status_code == 400
+        data = res.json()
+        assert data["detail"]["code"] == "PAYMENT_METHOD_UNAVAILABLE"
+
+
+def test_status_endpoint_returns_va_number_and_payment_method(db, duitku_user, duitku_client):
+    """Polling /billing/transactions/{id}/status returns va_number and payment_method."""
+    tx = PaymentTransaction(
+        user_id=duitku_user.id,
+        plan="pro",
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="duitku",
+        provider_mode="sandbox",
+        external_id="dtk_va_status_test_001",
+        payment_method="BC",
+        va_number="7007014001444348",
+        created_at=utcnow(),
+        updated_at=utcnow(),
+    )
+    db.add(tx)
+    db.commit()
+
+    res = duitku_client.get(f"/billing/transactions/{tx.id}/status")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["payment_method"] == "BC"
+    assert data["va_number"] == "7007014001444348"
+    assert data["status"] == "PENDING"
+
 

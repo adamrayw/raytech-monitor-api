@@ -128,6 +128,7 @@ def test_rapid_duplicate_checkout_reuses_active_pending_session(db, non_legacy_f
         external_id="rtm_pro_existing_123",
         provider="duitku",
         provider_payment_id="dtk_ref_existing",
+        payment_method="SP",
         checkout_url="https://sandbox.duitku.com/pay",
         created_at=utcnow(),
         updated_at=utcnow(),
