@@ -12,33 +12,24 @@ from app.dependencies.auth import get_current_user
 from app.models.payment_transaction import PaymentTransaction
 from app.models.user import User
 from app.services.duitku_service import (
+    PRO_PLAN_ID,
+    PRO_SUBSCRIPTION_AMOUNT_IDR,
+    PRO_SUBSCRIPTION_DURATION_DAYS,
     DuitkuApiError,
     DuitkuConfigurationError,
     create_duitku_transaction,
     generate_duitku_order_id,
     get_duitku_api_key,
     get_duitku_mode,
+    is_user_allowed_sandbox_checkout,
 )
 from app.services.payment_service import reconcile_and_process_payment
 from app.services.rate_limiter import api_rate_limiter
 from app.services.subscription_service import (
     activate_pro_from_payment,
+    ensure_utc,
     get_effective_plan,
     utcnow,
-)
-from app.services.xendit_service import (
-    PRO_PLAN_ID,
-    PRO_SUBSCRIPTION_AMOUNT_IDR,
-    PRO_SUBSCRIPTION_DURATION_DAYS,
-    XenditApiError,
-    XenditConfigurationError,
-    create_xendit_invoice,
-    generate_external_id,
-    get_frontend_url,
-    get_xendit_invoice,
-    get_xendit_mode,
-    get_xendit_secret_key,
-    is_user_allowed_sandbox_checkout,
 )
 
 logger = logging.getLogger("raytech.billing")
@@ -48,7 +39,7 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 
 class CheckoutRequest(BaseModel):
     plan: str = Field(default=PRO_PLAN_ID, description="Target plan ID ('pro')")
-    provider: str = Field(default="xendit", description="Payment provider adapter ('duitku' or 'xendit')")
+    provider: str = Field(default="duitku", description="Payment provider adapter ('duitku')")
     payment_method: str | None = Field(default="SP", description="Duitku payment method code (e.g. 'SP' for QRIS)")
 
 
@@ -68,8 +59,9 @@ def create_checkout_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Creates a local pending payment transaction and requests a checkout session from Duitku or Xendit.
+    """Creates a local pending payment transaction and requests a checkout session from Duitku.
 
+    Xendit payment gateway has been retired from active checkout. Duitku is the sole active payment provider.
     Price and duration are authoritative on the backend (IDR 49,000 for 30 days).
     Client cannot supply custom amounts or duration.
     """
@@ -90,12 +82,12 @@ def create_checkout_session(
         )
 
     requested_provider = (payload.provider or "duitku").strip().lower()
-    if requested_provider not in ("duitku", "xendit"):
+    if requested_provider != "duitku":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
-                "code": "INVALID_PROVIDER",
-                "message": "Only 'duitku' and 'xendit' providers are supported.",
+                "code": "GATEWAY_DISABLED",
+                "message": "Xendit payment gateway has been retired. Duitku is the only active payment gateway.",
             },
         )
 
@@ -117,14 +109,14 @@ def create_checkout_session(
         )
 
     # 1. Idempotency protection against rapid repeated clicks:
-    # If a pending transaction exists created within last 15 minutes for this provider with a valid checkout_url, reuse it.
+    # If a pending transaction exists created within last 15 minutes for Duitku with a valid checkout_url, reuse it.
     fifteen_mins_ago = utcnow() - timedelta(minutes=15)
     existing_pending = db.scalar(
         select(PaymentTransaction)
         .where(
             PaymentTransaction.user_id == current_user.id,
             PaymentTransaction.status == "PENDING",
-            PaymentTransaction.provider == requested_provider,
+            PaymentTransaction.provider == "duitku",
             PaymentTransaction.created_at >= fifteen_mins_ago,
             PaymentTransaction.checkout_url.isnot(None),
         )
@@ -133,7 +125,7 @@ def create_checkout_session(
     )
 
     if existing_pending and existing_pending.checkout_url:
-        logger.info(f"Reusing active pending checkout tx {existing_pending.id} for user {current_user.id} ({requested_provider})")
+        logger.info(f"Reusing active pending checkout tx {existing_pending.id} for user {current_user.id} (duitku)")
         return {
             "transaction_id": existing_pending.id,
             "external_id": existing_pending.external_id,
@@ -148,12 +140,8 @@ def create_checkout_session(
         }
 
     # 2. Determine mode and unique external order reference
-    if requested_provider == "duitku":
-        external_id = generate_duitku_order_id(current_user.id)
-        provider_mode = get_duitku_mode()
-    else:
-        external_id = generate_external_id(current_user.id)
-        provider_mode = get_xendit_mode()
+    external_id = generate_duitku_order_id(current_user.id)
+    provider_mode = get_duitku_mode()
 
     # 3. Create local pending transaction record
     tx = PaymentTransaction(
@@ -162,7 +150,7 @@ def create_checkout_session(
         amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
         currency="IDR",
         status="PENDING",
-        provider=requested_provider,
+        provider="duitku",
         provider_mode=provider_mode,
         external_id=external_id,
         created_at=utcnow(),
@@ -172,103 +160,52 @@ def create_checkout_session(
     db.commit()
     db.refresh(tx)
 
-    # 4. Initiate provider checkout
-    if requested_provider == "duitku":
-        try:
-            data = create_duitku_transaction(
-                merchant_order_id=tx.external_id,
-                amount=tx.amount,
-                payer_email=current_user.email,
-                customer_name=current_user.name or "Raytech Subscriber",
-                payment_method=payload.payment_method or "SP",
-            )
-        except DuitkuConfigurationError as exc:
-            tx.status = "FAILED"
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "GATEWAY_CONFIG_ERROR", "message": str(exc)},
-            )
-        except DuitkuApiError as exc:
-            tx.status = "FAILED"
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={"code": "GATEWAY_API_ERROR", "message": str(exc)},
-            )
-
-        tx.provider_payment_id = data.get("reference")
-        tx.checkout_url = data.get("paymentUrl")
-        tx.qr_string = data.get("qrString")
-        tx.payment_method = payload.payment_method or "SP"
-        tx.payment_channel = "duitku"
-        tx.expires_at = utcnow() + timedelta(hours=24)
-        tx.updated_at = utcnow()
+    # 4. Initiate provider checkout via Duitku
+    try:
+        data = create_duitku_transaction(
+            merchant_order_id=tx.external_id,
+            amount=tx.amount,
+            payer_email=current_user.email,
+            customer_name=current_user.name or "Raytech Subscriber",
+            payment_method=payload.payment_method or "SP",
+        )
+    except DuitkuConfigurationError as exc:
+        tx.status = "FAILED"
         db.commit()
-        db.refresh(tx)
-
-        return {
-            "transaction_id": tx.id,
-            "external_id": tx.external_id,
-            "provider": tx.provider,
-            "provider_mode": tx.provider_mode,
-            "checkout_url": tx.checkout_url,
-            "qr_string": tx.qr_string,
-            "amount": tx.amount,
-            "currency": tx.currency,
-            "status": tx.status,
-            "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
-        }
-
-    else:
-        # Xendit checkout
-        frontend_base = get_frontend_url()
-        success_url = f"{frontend_base}/settings/billing?checkout_id={tx.id}&status=success"
-        failure_url = f"{frontend_base}/settings/billing?checkout_id={tx.id}&status=failed"
-
-        try:
-            invoice = create_xendit_invoice(
-                external_id=tx.external_id,
-                amount=tx.amount,
-                payer_email=current_user.email,
-                description=f"Raytech Monitor Pro ({PRO_SUBSCRIPTION_DURATION_DAYS} Days)",
-                success_redirect_url=success_url,
-                failure_redirect_url=failure_url,
-            )
-        except XenditConfigurationError as exc:
-            tx.status = "FAILED"
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "GATEWAY_CONFIG_ERROR", "message": str(exc)},
-            )
-        except XenditApiError as exc:
-            tx.status = "FAILED"
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={"code": "GATEWAY_API_ERROR", "message": str(exc)},
-            )
-
-        tx.provider_payment_id = invoice.get("id")
-        tx.checkout_url = invoice.get("invoice_url")
-        tx.expires_at = parse_iso_datetime(invoice.get("expiry_date"))
-        tx.updated_at = utcnow()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "GATEWAY_CONFIG_ERROR", "message": str(exc)},
+        )
+    except DuitkuApiError as exc:
+        tx.status = "FAILED"
         db.commit()
-        db.refresh(tx)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "GATEWAY_API_ERROR", "message": str(exc)},
+        )
 
-        return {
-            "transaction_id": tx.id,
-            "external_id": tx.external_id,
-            "provider": tx.provider,
-            "provider_mode": tx.provider_mode,
-            "checkout_url": tx.checkout_url,
-            "qr_string": None,
-            "amount": tx.amount,
-            "currency": tx.currency,
-            "status": tx.status,
-            "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
-        }
+    tx.provider_payment_id = data.get("reference")
+    tx.checkout_url = data.get("paymentUrl")
+    tx.qr_string = data.get("qrString")
+    tx.payment_method = payload.payment_method or "SP"
+    tx.payment_channel = "duitku"
+    tx.expires_at = utcnow() + timedelta(hours=24)
+    tx.updated_at = utcnow()
+    db.commit()
+    db.refresh(tx)
+
+    return {
+        "transaction_id": tx.id,
+        "external_id": tx.external_id,
+        "provider": tx.provider,
+        "provider_mode": tx.provider_mode,
+        "checkout_url": tx.checkout_url,
+        "qr_string": tx.qr_string,
+        "amount": tx.amount,
+        "currency": tx.currency,
+        "status": tx.status,
+        "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
+    }
 
 
 @router.get("/transactions", summary="List user billing payment history")
@@ -364,6 +301,7 @@ def get_transaction_detail(
 @router.get("/transactions/{transaction_id}/status", summary="Poll transaction settlement status")
 def get_transaction_status(
     transaction_id: int,
+    sync: bool = Query(default=False, description="Force sync with provider if pending"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
@@ -390,22 +328,31 @@ def get_transaction_status(
             detail="Transaction not found.",
         )
 
-    # Reconcile authoritatively if not yet PAID and credentials exist
-    if tx.status != "PAID":
-        if tx.provider == "duitku" and get_duitku_api_key():
-            try:
-                reconcile_and_process_payment(db=db, transaction_id=tx.id)
-                db.refresh(tx)
-            except Exception as err:
-                logger.warning(f"Authoritative Duitku reconciliation skipped during polling for tx {tx.id}: {err}")
-        elif tx.provider == "xendit" and tx.provider_payment_id and get_xendit_secret_key():
-            try:
-                reconcile_and_process_payment(db=db, transaction_id=tx.id)
-                db.refresh(tx)
-            except Exception as err:
-                logger.warning(f"Authoritative Xendit reconciliation skipped during polling for tx {tx.id}: {err}")
+    now = utcnow()
+    # Reconcile authoritatively if PENDING and credentials exist.
+    # Throttle external calls to Duitku to at most once every 10 seconds per transaction unless sync is requested
+    if tx.status == "PENDING":
+        if tx.provider == "duitku" and bool(get_duitku_api_key()):
+            tx_updated = ensure_utc(tx.updated_at)
+            seconds_since_update = (now - tx_updated).total_seconds() if tx_updated else 999.0
+            if sync or seconds_since_update >= 10.0:
+                try:
+                    reconcile_and_process_payment(db=db, transaction_id=tx.id)
+                    db.refresh(tx)
+                except Exception as err:
+                    logger.warning(f"Authoritative Duitku reconciliation skipped during polling for tx {tx.id}: {err}")
+                    tx.updated_at = now
+                    db.commit()
+        elif tx.provider == "xendit" and tx.provider_payment_id:
+            from app.services.xendit_service import get_xendit_secret_key
+            if get_xendit_secret_key():
+                try:
+                    reconcile_and_process_payment(db=db, transaction_id=tx.id)
+                    db.refresh(tx)
+                except Exception as err:
+                    logger.warning(f"Authoritative Xendit reconciliation skipped during polling for tx {tx.id}: {err}")
 
-    effective_plan, _ = get_effective_plan(db, current_user.id)
+    effective_plan, sub = get_effective_plan(db, current_user.id)
 
     return {
         "id": tx.id,
@@ -420,4 +367,5 @@ def get_transaction_status(
         "qr_string": tx.qr_string,
         "paid_at": tx.paid_at.isoformat() if tx.paid_at else None,
         "is_pro_active": effective_plan == PRO_PLAN_ID,
+        "current_period_end": sub.current_period_end.isoformat() if (sub and sub.current_period_end) else None,
     }

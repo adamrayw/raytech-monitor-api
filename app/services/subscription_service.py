@@ -544,6 +544,7 @@ def activate_pro_from_payment(
     transaction_id: int,
     duration_days: int = 30,
     commit: bool = True,
+    provider: str = "duitku",
 ) -> UserSubscription:
     """Activates or extends 30 days of Pro entitlements after a verified payment.
 
@@ -571,29 +572,26 @@ def activate_pro_from_payment(
     previous_plan = sub.plan
 
     cur_end = ensure_utc(sub.current_period_end)
-    if getattr(sub, "legacy_override", False):
+
+    if cur_end is not None and cur_end > now:
+        # Active paid Pro with remaining time: extend exactly 30 days from previous current_period_end
+        sub.current_period_end = cur_end + timedelta(days=duration_days)
         sub.plan = "pro"
         sub.status = "active"
-        sub.current_period_start = now
-        sub.current_period_end = now + timedelta(days=duration_days)
-        sub.override_reason = f"xendit_payment:{transaction_id} (legacy grandfathered)"
-        event_type = "pro_extended" if previous_plan == "pro" else "pro_activated"
-    elif sub.plan == "pro" and cur_end is not None and cur_end > now:
-        # Active paid Pro; extend end date from current_period_end
-        sub.current_period_end = cur_end + timedelta(days=duration_days)
-        sub.override_reason = f"xendit_payment:{transaction_id}"
+        sub.override_reason = f"{provider}_payment:{transaction_id}"
         event_type = "pro_extended"
     else:
-        # Free tier or expired Pro
+        # Free tier, expired Pro, or current_period_end in past/None: start fresh 30-day period
         sub.plan = "pro"
         sub.status = "active"
         sub.current_period_start = now
         sub.current_period_end = now + timedelta(days=duration_days)
-        sub.override_reason = f"xendit_payment:{transaction_id}"
+        sub.override_reason = f"{provider}_payment:{transaction_id}"
         event_type = "pro_activated"
 
     sub.cancel_at_period_end = False
     sub.updated_at = now
+    db.add(sub)
 
     record_subscription_audit_event(
         db=db,
@@ -602,7 +600,7 @@ def activate_pro_from_payment(
         previous_plan=previous_plan,
         new_plan="pro",
         event_type=event_type,
-        reason=f"xendit_payment:{transaction_id}",
+        reason=f"{provider}_payment:{transaction_id}",
         payment_transaction_id=transaction_id,
         commit=False,
     )

@@ -475,7 +475,15 @@ def test_rate_limiting_billing_checkout(client, test_user):
     try:
         app.dependency_overrides[get_current_user] = lambda: test_user
 
-        with patch("app.routes.billing.create_xendit_invoice", return_value={"id": "inv_1", "invoice_url": "https://pay"}):
+        mock_duitku_resp = {
+            "statusCode": "00",
+            "statusMessage": "SUCCESS",
+            "reference": "DTK_RATE_LIMIT",
+            "paymentUrl": "https://sandbox.duitku.com/pay",
+            "qrString": "mock_qr",
+            "amount": "49000",
+        }
+        with patch("app.routes.billing.create_duitku_transaction", return_value=mock_duitku_resp):
             for _ in range(10):
                 client.post("/billing/checkout", json={"plan": "pro"})
 

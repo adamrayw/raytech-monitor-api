@@ -321,3 +321,55 @@ def get_duitku_transaction_status(merchant_order_id: str) -> dict[str, Any]:
         f"Duitku check status for {merchant_order_id}: statusCode={data.get('statusCode')}, statusMessage={data.get('statusMessage')}"
     )
     return data
+
+
+def interpret_duitku_status(status_data: dict[str, Any]) -> tuple[str, str]:
+    """Interprets Duitku Check Transaction response status authoritatively.
+
+    Returns (normalized_status, raw_status_code).
+    Valid normalized states: 'PAID', 'PENDING', 'FAILED', 'EXPIRED'.
+
+    Duitku Specification:
+    - statusCode '00': SUCCESS (only when statusMessage indicates SUCCESS)
+    - statusCode '01': PENDING (Process / Pending payment)
+    - statusCode '02': FAILED / EXPIRED / CANCELED
+    Transport HTTP 200 MUST NOT be treated as success unless statusCode == '00'.
+    """
+    raw_code = str(status_data.get("statusCode", "")).strip()
+    raw_msg = str(status_data.get("statusMessage", "")).strip().upper()
+
+    if raw_code == "00":
+        # Fail closed: statusMessage must not indicate failure/pending
+        if any(neg in raw_msg for neg in ("PENDING", "PROCESS", "FAIL", "EXPIRE", "CANCEL", "NOT FOUND")):
+            logger.warning(f"Duitku statusCode '00' contradicted by statusMessage: '{raw_msg}'. Treating as PENDING.")
+            return "PENDING", raw_code
+        return "PAID", raw_code
+    elif raw_code == "01":
+        return "PENDING", raw_code
+    elif raw_code in ("02", "FAILED", "CANCELED", "EXPIRED"):
+        if "EXPIRE" in raw_msg:
+            return "EXPIRED", raw_code
+        return "FAILED", raw_code
+    else:
+        # Unknown code or missing, fail closed to PENDING
+        return "PENDING", raw_code
+
+
+def is_user_allowed_sandbox_checkout(user: Any) -> bool:
+    """Determines whether a user is permitted to initiate Duitku Sandbox checkout."""
+    if not user or not getattr(user, "email", None):
+        return False
+    mode = os.environ.get("DUITKU_MODE", "sandbox").strip().lower()
+    if mode != "sandbox":
+        return True
+    allowlist_raw = os.environ.get("SANDBOX_CHECKOUT_ALLOWLIST", "").strip()
+    if not allowlist_raw:
+        return user.email.lower().endswith("@raytech.cloud")
+    allowed_entries = [entry.strip().lower() for entry in allowlist_raw.split(",") if entry.strip()]
+    email_lower = user.email.lower()
+    for entry in allowed_entries:
+        if entry.startswith("@") and email_lower.endswith(entry):
+            return True
+        if email_lower == entry:
+            return True
+    return False

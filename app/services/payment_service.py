@@ -12,6 +12,7 @@ from app.services.duitku_service import (
     DuitkuApiError,
     DuitkuConfigurationError,
     get_duitku_transaction_status,
+    interpret_duitku_status,
 )
 from app.services.subscription_service import activate_pro_from_payment, utcnow
 from app.services.xendit_service import (
@@ -124,9 +125,9 @@ def reconcile_and_process_payment(
                 detail={"error": f"Amount must be IDR {PRO_SUBSCRIPTION_AMOUNT_IDR}"},
             )
 
-        duitku_status_code = str(status_data.get("statusCode", "")).strip()
+        normalized_status, raw_status_code = interpret_duitku_status(status_data)
 
-        if duitku_status_code == "00":  # Success
+        if normalized_status == "PAID":
             allowed = VALID_TRANSITIONS.get(tx.status, set())
             if "PAID" not in allowed:
                 logger.warning(f"Disallowed state transition from {tx.status} to PAID for tx {tx.id}")
@@ -163,15 +164,15 @@ def reconcile_and_process_payment(
             logger.info(f"Duitku authoritative settlement successful: user {tx.user_id} Pro activated via tx {tx.id}")
             return "activated", tx
 
-        elif duitku_status_code in ("02", "FAILED", "CANCELED"):
+        elif normalized_status in ("FAILED", "EXPIRED"):
             if tx.status == "PENDING":
-                tx.status = "FAILED"
+                tx.status = normalized_status
                 tx.updated_at = utcnow()
                 db.commit()
                 db.refresh(tx)
-            return "failed", tx
+            return "failed" if normalized_status == "FAILED" else "expired", tx
 
-        elif duitku_status_code == "01":  # Pending
+        else:  # PENDING
             if webhook_payload and (
                 str(webhook_payload.get("resultCode", "")) == "00"
                 or str(webhook_payload.get("status", "")).upper() in ("PAID", "SETTLED")
@@ -181,9 +182,10 @@ def reconcile_and_process_payment(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail={"error": "Authoritative invoice status is still PENDING"},
                 )
+            tx.updated_at = utcnow()
+            db.commit()
+            db.refresh(tx)
             return "pending", tx
-
-        return "unhandled", tx
 
     # --- XENDIT RECONCILIATION PATH ---
     # 4. Determine target provider invoice ID
@@ -258,6 +260,7 @@ def reconcile_and_process_payment(
             transaction_id=tx.id,
             duration_days=PRO_SUBSCRIPTION_DURATION_DAYS,
             commit=False,
+            provider="xendit",
         )
 
         user = db.get(User, tx.user_id)

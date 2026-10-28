@@ -82,8 +82,16 @@ def get_user_subscription(
 
     if is_pro:
         if latest_paid_tx:
-            channel_info = f" ({latest_paid_tx.payment_channel})" if latest_paid_tx.payment_channel else ""
-            payment_method = f"Xendit{channel_info}"
+            if latest_paid_tx.provider == "duitku":
+                mode_str = " (Sandbox)" if latest_paid_tx.provider_mode == "sandbox" else ""
+                method_name = latest_paid_tx.payment_method or "QRIS"
+                payment_method = f"Duitku {method_name}{mode_str}"
+            elif latest_paid_tx.provider == "xendit":
+                channel_info = f" ({latest_paid_tx.payment_channel})" if latest_paid_tx.payment_channel else ""
+                payment_method = f"Xendit (Historical){channel_info}"
+            else:
+                channel_info = f" ({latest_paid_tx.payment_channel})" if latest_paid_tx.payment_channel else ""
+                payment_method = f"{latest_paid_tx.provider}{channel_info}"
         elif getattr(sub, "legacy_override", False):
             payment_method = "Legacy Grandfathered"
         else:
@@ -105,7 +113,7 @@ def get_user_subscription(
     end_wib = format_wib_datetime(sub.current_period_end) if sub.current_period_end else None
     is_expired_pro = (sub.status == "expired") or (not is_pro and tx_count > 0)
 
-    from app.services.xendit_service import is_user_allowed_sandbox_checkout
+    from app.services.duitku_service import is_user_allowed_sandbox_checkout
 
     sandbox_checkout_allowed = is_user_allowed_sandbox_checkout(current_user)
 

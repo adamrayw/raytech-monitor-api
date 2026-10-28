@@ -29,7 +29,7 @@ from app.services.duitku_service import (
     verify_duitku_callback_signature,
 )
 from app.services.payment_service import reconcile_and_process_payment
-from app.services.subscription_service import get_effective_plan, utcnow
+from app.services.subscription_service import activate_pro_from_payment, ensure_utc, get_effective_plan, utcnow
 
 TEST_MERCHANT_CODE = "D12345"
 TEST_API_KEY = "test_duitku_api_key_secret_12345678"
@@ -540,8 +540,8 @@ def test_polling_triggers_authoritative_sync(db, duitku_user, duitku_client):
         provider="duitku",
         provider_mode="sandbox",
         external_id=order_id,
-        created_at=utcnow(),
-        updated_at=utcnow(),
+        created_at=utcnow() - timedelta(seconds=15),
+        updated_at=utcnow() - timedelta(seconds=15),
     )
     db.add(tx)
     db.commit()
@@ -591,3 +591,190 @@ def test_transactions_history_returns_provider_fields(db, duitku_user, duitku_cl
     assert found["provider"] == "duitku"
     assert found["provider_mode"] == "sandbox"
     assert found["qr_string"] == "mock_history_qr_string"
+
+
+# =========================================================================
+# 5. Part 10 Comprehensive Regression Tests
+# =========================================================================
+
+def test_qr_creation_does_not_activate_pro_or_set_paid_at(db, duitku_user, duitku_client):
+    """Checkout QR generation MUST NOT activate Pro and MUST NOT populate paid_at."""
+    mock_duitku_resp = {
+        "statusCode": "00",
+        "statusMessage": "SUCCESS",
+        "reference": "DTK_REF_MOCK_QR_TEST",
+        "paymentUrl": "https://sandbox.duitku.com/topup/topupdirectv2.aspx?ref=MOCK_QR",
+        "qrString": "00020101021226660014ID.DANA.WWW011893600911002151500102152006170915150010303UME",
+        "amount": "49000",
+    }
+
+    with patch("app.routes.billing.create_duitku_transaction", return_value=mock_duitku_resp):
+        res = duitku_client.post("/billing/checkout", json={"plan": "pro", "provider": "duitku"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["status"] == "PENDING"
+        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == body["transaction_id"]))
+        assert tx.status == "PENDING"
+        assert tx.paid_at is None
+
+        # Verify user remains FREE
+        effective_plan, sub = get_effective_plan(db, duitku_user.id)
+        assert effective_plan == "free"
+        assert sub.status == "active"
+        assert sub.current_period_end is None
+
+
+def test_polling_provider_status_01_remains_pending(db, duitku_user, duitku_client):
+    """When Duitku Check Transaction returns 01 (Process/Pending), transaction remains PENDING and Pro is not active."""
+    order_id = generate_duitku_order_id(duitku_user.id)
+    tx = PaymentTransaction(
+        user_id=duitku_user.id,
+        plan="pro",
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="duitku",
+        provider_mode="sandbox",
+        external_id=order_id,
+        created_at=utcnow() - timedelta(seconds=15),
+        updated_at=utcnow() - timedelta(seconds=15),
+    )
+    db.add(tx)
+    db.commit()
+
+    mock_status_pending = {
+        "merchantOrderId": order_id,
+        "reference": "DTK_REF_STILL_PENDING",
+        "amount": "49000",
+        "statusCode": "01",  # Pending / In Process
+        "statusMessage": "In Process",
+    }
+
+    with patch("app.services.payment_service.get_duitku_transaction_status", return_value=mock_status_pending):
+        res = duitku_client.get(f"/billing/transactions/{tx.id}/status")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "PENDING"
+        assert data["is_pro_active"] is False
+
+    db.refresh(tx)
+    assert tx.status == "PENDING"
+    assert tx.paid_at is None
+    effective_plan, _ = get_effective_plan(db, duitku_user.id)
+    assert effective_plan == "free"
+
+
+def test_provider_status_02_marks_failed_and_does_not_activate_pro(db, duitku_user, duitku_client):
+    """When Duitku Check Transaction returns 02 (Failed/Expired/Canceled), status is set to FAILED and Pro is not activated."""
+    order_id = generate_duitku_order_id(duitku_user.id)
+    tx = PaymentTransaction(
+        user_id=duitku_user.id,
+        plan="pro",
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="duitku",
+        provider_mode="sandbox",
+        external_id=order_id,
+        created_at=utcnow() - timedelta(seconds=15),
+        updated_at=utcnow() - timedelta(seconds=15),
+    )
+    db.add(tx)
+    db.commit()
+
+    mock_status_failed = {
+        "merchantOrderId": order_id,
+        "reference": "DTK_REF_EXPIRED",
+        "amount": "49000",
+        "statusCode": "02",  # Failed / Expired
+        "statusMessage": "Expired / Canceled",
+    }
+
+    with patch("app.services.payment_service.get_duitku_transaction_status", return_value=mock_status_failed):
+        res = duitku_client.get(f"/billing/transactions/{tx.id}/status")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] in ("FAILED", "EXPIRED")
+        assert data["is_pro_active"] is False
+
+    db.refresh(tx)
+    assert tx.status in ("FAILED", "EXPIRED")
+    assert tx.paid_at is None
+    effective_plan, _ = get_effective_plan(db, duitku_user.id)
+    assert effective_plan == "free"
+
+
+def test_callback_mismatched_merchant_code_rejected(db, duitku_user, client):
+    """Callback with wrong merchantCode is rejected immediately."""
+    order_id = generate_duitku_order_id(duitku_user.id)
+    tx = PaymentTransaction(
+        user_id=duitku_user.id,
+        plan="pro",
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="duitku",
+        provider_mode="sandbox",
+        external_id=order_id,
+        created_at=utcnow(),
+        updated_at=utcnow(),
+    )
+    db.add(tx)
+    db.commit()
+
+    sig = hmac.new(
+        TEST_API_KEY.encode("utf-8"),
+        f"WRONG_CODE49000{order_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    res = client.post(
+        "/webhooks/duitku",
+        data={
+            "merchantCode": "WRONG_CODE",
+            "amount": "49000",
+            "merchantOrderId": order_id,
+            "resultCode": "00",
+            "signature": sig,
+        },
+    )
+    assert res.status_code == 403
+    assert "Invalid" in res.json()["detail"]["error"]
+
+
+def test_subscription_extension_duration_matrix(db):
+    """Test subscription extension calculations for Free, Expired Pro, and Active Pro."""
+    user = User(
+        email="duration_matrix@raytech.cloud",
+        name="Duration Matrix User",
+        google_sub="sub-matrix-user",
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+
+    # Case A: Free user -> adds exactly 30 days
+    sub_a = activate_pro_from_payment(db, user.id, transaction_id=1, duration_days=30, commit=True)
+    assert sub_a.plan == "pro"
+    assert sub_a.status == "active"
+    expected_end_a = utcnow() + timedelta(days=30)
+    diff_a = abs((ensure_utc(sub_a.current_period_end) - expected_end_a).total_seconds())
+    assert diff_a < 5.0  # within 5 seconds
+
+    # Case B: Active Pro -> extends by 30 days from existing current_period_end
+    current_end_before = ensure_utc(sub_a.current_period_end)
+    sub_b = activate_pro_from_payment(db, user.id, transaction_id=2, duration_days=30, commit=True)
+    expected_end_b = current_end_before + timedelta(days=30)
+    diff_b = abs((ensure_utc(sub_b.current_period_end) - expected_end_b).total_seconds())
+    assert diff_b < 5.0
+
+    # Case C: Expired Pro -> resets from now + 30 days
+    sub_b.current_period_end = utcnow() - timedelta(days=10)
+    sub_b.plan = "free"
+    db.commit()
+
+    sub_c = activate_pro_from_payment(db, user.id, transaction_id=3, duration_days=30, commit=True)
+    expected_end_c = utcnow() + timedelta(days=30)
+    diff_c = abs((ensure_utc(sub_c.current_period_end) - expected_end_c).total_seconds())
+    assert diff_c < 5.0
+

@@ -89,34 +89,11 @@ def test_unauthenticated_checkout_rejected(client):
     assert res.status_code == 401
 
 
-def test_free_user_can_create_checkout(db, non_legacy_free_user, buyer_client):
-    """Free user can create a checkout session which contacts Xendit and returns checkout_url."""
-    mock_xendit_resp = {
-        "id": "xnd_inv_mock_12345",
-        "external_id": "rtm_pro_mock_ref",
-        "invoice_url": "https://checkout-staging.xendit.co/v2/mock12345",
-        "expiry_date": (utcnow() + timedelta(hours=24)).isoformat(),
-        "status": "PENDING",
-        "amount": 49000,
-        "currency": "IDR",
-    }
-
-    with patch("app.routes.billing.create_xendit_invoice", return_value=mock_xendit_resp) as mock_create:
-        res = buyer_client.post("/billing/checkout", json={"plan": "pro"})
-        assert res.status_code == 200
-        data = res.json()
-        assert data["transaction_id"] > 0
-        assert data["checkout_url"] == "https://checkout-staging.xendit.co/v2/mock12345"
-        assert data["amount"] == 49000
-        assert data["currency"] == "IDR"
-        assert data["status"] == "PENDING"
-        assert mock_create.called
-
-        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == data["transaction_id"]))
-        assert tx is not None
-        assert tx.user_id == non_legacy_free_user.id
-        assert tx.provider_payment_id == "xnd_inv_mock_12345"
-        assert tx.status == "PENDING"
+def test_xendit_gateway_disabled_on_checkout(buyer_client):
+    """Xendit is removed/disabled as an active payment gateway; checkout with xendit returns 400 GATEWAY_DISABLED."""
+    res = buyer_client.post("/billing/checkout", json={"plan": "pro", "provider": "xendit"})
+    assert res.status_code == 400
+    assert res.json()["detail"]["code"] == "GATEWAY_DISABLED"
 
 
 def test_client_cannot_override_amount_or_duration(db, non_legacy_free_user, buyer_client):
@@ -124,15 +101,15 @@ def test_client_cannot_override_amount_or_duration(db, non_legacy_free_user, buy
     res_bad_plan = buyer_client.post("/billing/checkout", json={"plan": "enterprise", "amount": 100})
     assert res_bad_plan.status_code == 400
 
-    mock_xendit_resp = {
-        "id": "xnd_inv_mock_999",
-        "external_id": "rtm_pro_mock_ref_999",
-        "invoice_url": "https://checkout-staging.xendit.co/v2/mock999",
-        "status": "PENDING",
-        "amount": 49000,
-        "currency": "IDR",
+    mock_duitku_resp = {
+        "statusCode": "00",
+        "statusMessage": "SUCCESS",
+        "reference": "DTK_REF_FIXED",
+        "paymentUrl": "https://sandbox.duitku.com/pay",
+        "qrString": "mock_qr",
+        "amount": "49000",
     }
-    with patch("app.routes.billing.create_xendit_invoice", return_value=mock_xendit_resp) as mock_create:
+    with patch("app.routes.billing.create_duitku_transaction", return_value=mock_duitku_resp) as mock_create:
         res = buyer_client.post("/billing/checkout", json={"plan": "pro", "amount": 1000})
         assert res.status_code == 200
         tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == res.json()["transaction_id"]))
@@ -149,15 +126,16 @@ def test_rapid_duplicate_checkout_reuses_active_pending_session(db, non_legacy_f
         currency="IDR",
         status="PENDING",
         external_id="rtm_pro_existing_123",
-        provider_payment_id="xnd_inv_existing",
-        checkout_url="https://checkout-staging.xendit.co/v2/existing",
+        provider="duitku",
+        provider_payment_id="dtk_ref_existing",
+        checkout_url="https://sandbox.duitku.com/pay",
         created_at=utcnow(),
         updated_at=utcnow(),
     )
     db.add(tx_existing)
     db.commit()
 
-    with patch("app.routes.billing.create_xendit_invoice") as mock_create:
+    with patch("app.routes.billing.create_duitku_transaction") as mock_create:
         res = buyer_client.post("/billing/checkout", json={"plan": "pro"})
         assert res.status_code == 200
         data = res.json()
@@ -165,12 +143,32 @@ def test_rapid_duplicate_checkout_reuses_active_pending_session(db, non_legacy_f
         assert not mock_create.called
 
 
-def test_checkout_gateway_failure_handled_gracefully(buyer_client):
-    """When Xendit returns a gateway error, API responds with 502/503 without crashing."""
-    with patch("app.routes.billing.create_xendit_invoice", side_effect=XenditApiError("Connection timeout", status_code=504)):
-        res = buyer_client.post("/billing/checkout", json={"plan": "pro"})
-        assert res.status_code == 502
-        assert res.json()["detail"]["code"] == "GATEWAY_API_ERROR"
+def test_historical_xendit_transactions_render_and_persist(db, non_legacy_free_user, buyer_client):
+    """Historical Xendit transactions remain readable in Billing History and are never deleted."""
+    historical_tx = PaymentTransaction(
+        user_id=non_legacy_free_user.id,
+        plan="pro",
+        amount=49000,
+        currency="IDR",
+        status="PAID",
+        provider="xendit",
+        provider_mode="test",
+        external_id="rtm_xendit_hist_001",
+        provider_payment_id="xnd_inv_hist_001",
+        paid_at=utcnow() - timedelta(days=60),
+        created_at=utcnow() - timedelta(days=60),
+        updated_at=utcnow() - timedelta(days=60),
+    )
+    db.add(historical_tx)
+    db.commit()
+
+    res = buyer_client.get("/billing/transactions")
+    assert res.status_code == 200
+    items = res.json()["items"]
+    hist_item = next((i for i in items if i["external_id"] == "rtm_xendit_hist_001"), None)
+    assert hist_item is not None
+    assert hist_item["provider"] == "xendit"
+    assert hist_item["status"] == "PAID"
 
 
 # =========================================================================
@@ -720,7 +718,7 @@ def test_manual_pro_account_purchasing_pro(db):
     db.add(sub)
     db.commit()
 
-    sub_res = activate_pro_from_payment(db, manual_user.id, transaction_id=77, duration_days=30, commit=True)
+    sub_res = activate_pro_from_payment(db, manual_user.id, transaction_id=77, duration_days=30, commit=True, provider="xendit")
     assert sub_res.plan == "pro"
     assert sub_res.current_period_end is not None
     end_tz = sub_res.current_period_end if sub_res.current_period_end.tzinfo else sub_res.current_period_end.replace(tzinfo=timezone.utc)
@@ -958,16 +956,17 @@ def test_custom_allowlist_environment_variable(db, client, monkeypatch):
 
         # 2. With specific email allowlist, should pass
         monkeypatch.setenv("SANDBOX_CHECKOUT_ALLOWLIST", "beta_tester@external-domain.org,admin@test.com")
-        mock_xendit_resp = {
-            "id": "xnd_inv_beta_123",
-            "invoice_url": "https://checkout-staging.xendit.co/v2/mock_beta",
-            "status": "PENDING",
-            "amount": 49000,
-            "currency": "IDR",
+        mock_duitku_resp = {
+            "statusCode": "00",
+            "statusMessage": "SUCCESS",
+            "reference": "DTK_INV_BETA_123",
+            "paymentUrl": "https://sandbox.duitku.com/mock_beta",
+            "qrString": "mock_qr_beta",
+            "amount": "49000",
         }
-        with patch("app.routes.billing.create_xendit_invoice", return_value=mock_xendit_resp):
+        with patch("app.routes.billing.create_duitku_transaction", return_value=mock_duitku_resp):
             res_allowed = client.post("/billing/checkout", json={"plan": "pro"})
             assert res_allowed.status_code == 200
-            assert res_allowed.json()["checkout_url"] == "https://checkout-staging.xendit.co/v2/mock_beta"
+            assert res_allowed.json()["checkout_url"] == "https://sandbox.duitku.com/mock_beta"
     finally:
         del app.dependency_overrides[get_current_user]
