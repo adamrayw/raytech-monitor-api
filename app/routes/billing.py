@@ -156,7 +156,7 @@ def create_checkout_session(
                 "code": "SANDBOX_CHECKOUT_RESTRICTED",
                 "message": (
                     "Pembelian paket Pro saat ini beroperasi dalam mode Sandbox tertutup (internal testing) "
-                    "dan belum dibuka untuk umum. Hubungi tim dukungan di alerts@raytech.cloud untuk "
+                    "dan belum dibuka untuk umum. Hubungi tim dukungan di support@raytech.cloud untuk "
                     "permohonan akses pengujian."
                 ),
             },

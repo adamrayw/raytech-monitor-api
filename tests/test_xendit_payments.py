@@ -923,7 +923,7 @@ def test_non_allowlisted_public_user_checkout_strictly_forbidden(db, client):
         assert res.status_code == 403
         data = res.json()
         assert data["detail"]["code"] == "SANDBOX_CHECKOUT_RESTRICTED"
-        assert "alerts@raytech.cloud" in data["detail"]["message"]
+        assert "support@raytech.cloud" in data["detail"]["message"]
 
         # Also verify GET /subscription reflects sandbox restriction
         sub_res = client.get("/subscription")
