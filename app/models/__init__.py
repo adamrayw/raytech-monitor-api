@@ -12,6 +12,7 @@ from app.models.status_page import StatusPage, StatusPageMonitor
 from app.models.subscription import UserSubscription
 from app.models.subscription_audit import SubscriptionAuditLog
 from app.models.payment_transaction import PaymentTransaction
+from app.models.webhook_event import ProcessedWebhookEvent
 
 __all__ = [
     "User",
@@ -29,5 +30,6 @@ __all__ = [
     "UserSubscription",
     "SubscriptionAuditLog",
     "PaymentTransaction",
+    "ProcessedWebhookEvent",
 ]
 

@@ -14,6 +14,12 @@ from app.services.duitku_service import (
     get_duitku_transaction_status,
     interpret_duitku_status,
 )
+from app.services.qrisgate_service import (
+    QRISGateApiError,
+    QRISGateConfigurationError,
+    get_qrisgate_api_key,
+    get_qrisgate_transaction,
+)
 from app.services.subscription_service import activate_pro_from_payment, utcnow
 from app.services.xendit_service import (
     PRO_SUBSCRIPTION_AMOUNT_IDR,
@@ -99,6 +105,81 @@ def reconcile_and_process_payment(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error": "Invoice ID mismatch"},
         )
+
+    # --- QRISGATE RECONCILIATION PATH ---
+    if tx.provider == "qrisgate":
+        normalized_status = None
+        paid_at_time = None
+
+        # Check via authenticated QRISGate API if API key is present
+        if get_qrisgate_api_key():
+            try:
+                target_id = tx.provider_payment_id or tx.external_id
+                status_data = get_qrisgate_transaction(target_id)
+                normalized_status = status_data.get("status")
+                raw_paid_at = status_data.get("paid_at")
+                if raw_paid_at:
+                    paid_at_time = parse_iso_datetime(raw_paid_at)
+            except Exception as exc:
+                logger.warning(f"Authoritative QRISGate API check failed for tx {tx.id}: {exc}")
+
+        # If not determined via API check, inspect webhook payload if provided
+        if not normalized_status and webhook_payload:
+            event_type = str(webhook_payload.get("event") or webhook_payload.get("type") or "").strip().lower()
+            if event_type == "payment.paid":
+                normalized_status = "PAID"
+                order_data = webhook_payload.get("data") if isinstance(webhook_payload.get("data"), dict) else webhook_payload
+                raw_paid_at = order_data.get("paid_at") or webhook_payload.get("paid_at")
+                if raw_paid_at:
+                    paid_at_time = parse_iso_datetime(raw_paid_at)
+
+        if normalized_status == "PAID":
+            allowed = VALID_TRANSITIONS.get(tx.status, set())
+            if "PAID" not in allowed:
+                logger.warning(f"Disallowed state transition from {tx.status} to PAID for tx {tx.id}")
+                return "invalid_transition", tx
+
+            now = utcnow()
+            tx.status = "PAID"
+            tx.paid_at = paid_at_time or now
+            tx.updated_at = now
+
+            sub = activate_pro_from_payment(
+                db=db,
+                user_id=tx.user_id,
+                transaction_id=tx.id,
+                duration_days=PRO_SUBSCRIPTION_DURATION_DAYS,
+                commit=False,
+            )
+
+            user = db.get(User, tx.user_id)
+            if user:
+                from app.services.email_service import enqueue_payment_confirmation_email
+                enqueue_payment_confirmation_email(
+                    db=db,
+                    user=user,
+                    transaction=tx,
+                    subscription=sub,
+                )
+
+            db.commit()
+            db.refresh(tx)
+            logger.info(f"QRISGate payment settlement successful: user {tx.user_id} Pro activated via tx {tx.id}")
+            return "activated", tx
+
+        elif normalized_status in ("FAILED", "EXPIRED"):
+            if tx.status == "PENDING":
+                tx.status = normalized_status
+                tx.updated_at = utcnow()
+                db.commit()
+                db.refresh(tx)
+            return "failed" if normalized_status == "FAILED" else "expired", tx
+
+        else:
+            tx.updated_at = utcnow()
+            db.commit()
+            db.refresh(tx)
+            return "pending", tx
 
     # --- DUITKU RECONCILIATION PATH ---
     if tx.provider == "duitku":

@@ -107,6 +107,16 @@ class PaymentTransaction(Base):
         nullable=True,
     )
 
+    unique_code: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    total_amount: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

@@ -9,7 +9,7 @@ from starlette.responses import Response
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -261,6 +261,15 @@ def startup():
                 conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS va_number VARCHAR(64);"))
                 conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS qr_string TEXT;"))
                 conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS provider_mode VARCHAR(32) NOT NULL DEFAULT 'sandbox';"))
+                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS unique_code INTEGER;"))
+                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS total_amount INTEGER;"))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS processed_webhook_events (
+                        event_id VARCHAR(128) PRIMARY KEY,
+                        provider VARCHAR(32) NOT NULL,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
             except Exception:
                 pass
             try:
@@ -290,10 +299,10 @@ def startup():
         logger.warning(f"Xendit environment check: {exc}")
 
     try:
-        from app.services.duitku_service import validate_duitku_environment
-        validate_duitku_environment()
+        from app.services.qrisgate_service import validate_qrisgate_environment
+        validate_qrisgate_environment()
     except Exception as exc:
-        logger.warning(f"Duitku environment check: {exc}")
+        logger.warning(f"QRISGate environment check: {exc}")
 
 
 app.include_router(monitors_router)
@@ -307,6 +316,32 @@ app.include_router(public_status_router)
 app.include_router(subscription_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
+app.include_router(webhooks_router, prefix="/api")
+
+# Explicit aliases required by QRISGate integration specs:
+from app.routes.billing import CheckoutRequest, create_checkout_session, get_order_by_id
+from app.dependencies.auth import get_current_user
+from app.database import get_db
+from app.models.user import User
+from sqlalchemy.orm import Session
+from typing import Any
+
+@app.post("/api/checkout", tags=["billing"], summary="Direct QRISGate checkout endpoint")
+def api_checkout_alias(
+    payload: CheckoutRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Alias for POST /billing/checkout fulfilling Task 1 specification."""
+    return create_checkout_session(payload=payload, db=db, current_user=current_user)
+
+@app.get("/api/v1/transactions/{transaction_id_or_external_id}", tags=["billing"], summary="Transaction polling endpoint")
+def api_v1_transaction_status(
+    transaction_id_or_external_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Alias for transaction order status and polling fulfilling Task 3 specification."""
+    return get_order_by_id(order_id=transaction_id_or_external_id, db=db)
 
 @app.get("/")
 def root():

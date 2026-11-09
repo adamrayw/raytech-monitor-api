@@ -1,18 +1,27 @@
+import json
 import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.payment_transaction import PaymentTransaction
+from app.models.webhook_event import ProcessedWebhookEvent
 from app.services.duitku_service import (
     DuitkuApiError,
     DuitkuConfigurationError,
     verify_duitku_callback_signature,
 )
 from app.services.payment_service import reconcile_and_process_payment
+from app.services.qrisgate_service import (
+    QRISGateApiError,
+    QRISGateConfigurationError,
+    verify_qrisgate_timestamp,
+    verify_qrisgate_webhook_signature,
+)
 from app.services.xendit_service import (
     XenditApiError,
     XenditConfigurationError,
@@ -233,3 +242,133 @@ async def xendit_webhook(
         return {"status": "failed", "transaction_id": tx.id}
     else:
         return {"status": outcome, "transaction_id": tx.id}
+
+
+@router.post("/qrisgate", summary="Handle QRISGate webhook payment notifications")
+async def qrisgate_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+    x_qrisgate_signature: str | None = Header(None, alias="x-qrisgate-signature"),
+    x_qrisgate_timestamp: str | None = Header(None, alias="x-qrisgate-timestamp"),
+) -> Response:
+    """Public webhook receiver endpoint for QRISGate payment callbacks.
+
+    Security & Reliability:
+    1. Reads raw bytes before parsing JSON to guarantee exact byte fidelity for signature.
+    2. Enforces timing-safe HMAC-SHA256 signature verification matching QRISGate spec.
+    3. Rejects 401 if signature is invalid or x-qrisgate-timestamp > 5 minutes (anti-replay).
+    4. Enforces idempotency via event_id; duplicates reply 200 without reprocessing.
+    5. On payment.paid: sets status PAID, marks paid_at, and executes fulfillment (Pro activation, email).
+    6. Returns 200 quickly (<5s).
+    """
+    # 1. Read RAW body
+    raw_body = await request.body()
+
+    # 2. Timing-safe HMAC-SHA256 signature verification
+    if not x_qrisgate_signature or not verify_qrisgate_webhook_signature(raw_body, x_qrisgate_signature):
+        logger.warning("Rejected QRISGate webhook: Invalid or missing x-qrisgate-signature")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Invalid or missing signature"},
+        )
+
+    # 3. Anti-replay verification (reject if timestamp > 5 minutes from now)
+    if not x_qrisgate_timestamp or not verify_qrisgate_timestamp(x_qrisgate_timestamp, max_age_seconds=300):
+        logger.warning(f"Rejected QRISGate webhook: Timestamp expired or missing ({x_qrisgate_timestamp})")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Timestamp outside acceptable 5-minute window or invalid"},
+        )
+
+    # 4. Parse JSON
+    try:
+        payload: dict[str, Any] = json.loads(raw_body.decode("utf-8"))
+    except Exception as exc:
+        logger.error(f"Failed to parse QRISGate webhook body as JSON: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "Invalid JSON body"},
+        )
+
+    event_id = str(payload.get("event_id") or payload.get("id") or "").strip()
+    event_type = str(payload.get("event") or payload.get("type") or "").strip().lower()
+    order_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+    # Idempotency check: if event_id already processed, reply 200 immediately
+    if event_id:
+        existing_event = db.scalar(
+            select(ProcessedWebhookEvent).where(ProcessedWebhookEvent.event_id == event_id)
+        )
+        if existing_event:
+            logger.info(f"QRISGate webhook event {event_id} has already been processed. Returning 200.")
+            return JSONResponse(
+                content={"status": "already_processed", "event_id": event_id},
+                status_code=status.HTTP_200_OK,
+            )
+
+    # 5. Process payment.paid event
+    if event_type == "payment.paid":
+        external_order_id = str(
+            order_data.get("external_order_id") or payload.get("external_order_id") or ""
+        ).strip()
+        transaction_id_qrg = str(
+            order_data.get("id") or order_data.get("transaction_id") or payload.get("transaction_id") or ""
+        ).strip()
+
+        tx = None
+        if external_order_id:
+            tx = db.scalar(
+                select(PaymentTransaction).where(
+                    PaymentTransaction.external_id == external_order_id
+                )
+            )
+        if not tx and transaction_id_qrg:
+            tx = db.scalar(
+                select(PaymentTransaction).where(
+                    PaymentTransaction.provider_payment_id == transaction_id_qrg
+                )
+            )
+
+        if not tx:
+            logger.warning(
+                f"QRISGate webhook received for unknown order: external_order_id={external_order_id}, provider_id={transaction_id_qrg}"
+            )
+            if event_id:
+                try:
+                    db.add(ProcessedWebhookEvent(event_id=event_id, provider="qrisgate"))
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            return JSONResponse(
+                content={"status": "order_not_found"},
+                status_code=status.HTTP_200_OK,
+            )
+
+        try:
+            outcome, updated_tx = reconcile_and_process_payment(
+                db=db,
+                transaction_id=tx.id,
+                expected_external_id=external_order_id or None,
+                webhook_payload=payload,
+            )
+            logger.info(f"QRISGate payment processed successfully for tx {tx.id}: outcome={outcome}")
+        except Exception as exc:
+            logger.error(f"Error reconciling QRISGate payment for tx {tx.id}: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"error": "Internal error processing payment"},
+            )
+
+    # Record processed event ID for strict idempotency
+    if event_id:
+        try:
+            db.add(ProcessedWebhookEvent(event_id=event_id, provider="qrisgate"))
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.warning(f"Could not persist processed event ID {event_id}: {exc}")
+
+    return JSONResponse(
+        content={"status": "ok", "event_id": event_id or None},
+        status_code=status.HTTP_200_OK,
+    )

@@ -12,11 +12,6 @@ from app.dependencies.auth import get_current_user
 from app.models.payment_transaction import PaymentTransaction
 from app.models.user import User
 from app.services.duitku_service import (
-    PRO_PLAN_ID,
-    PRO_SUBSCRIPTION_AMOUNT_IDR,
-    PRO_SUBSCRIPTION_DURATION_DAYS,
-    DuitkuApiError,
-    DuitkuConfigurationError,
     create_duitku_transaction,
     generate_duitku_order_id,
     get_duitku_api_key,
@@ -25,6 +20,21 @@ from app.services.duitku_service import (
     is_user_allowed_sandbox_checkout,
 )
 from app.services.payment_service import reconcile_and_process_payment
+from app.services.qrisgate_service import (
+    PRO_PLAN_ID,
+    PRO_SUBSCRIPTION_AMOUNT_IDR,
+    PRO_SUBSCRIPTION_DURATION_DAYS,
+    QRISGateApiError,
+    QRISGateConfigurationError,
+    QRISGateInsufficientCreditError,
+    QRISGateRateLimitError,
+    QRISGateValidationError,
+    create_qrisgate_transaction,
+    generate_qrisgate_order_id,
+    get_frontend_url,
+    get_qrisgate_api_key,
+    get_qrisgate_payment_methods,
+)
 from app.services.rate_limiter import api_rate_limiter
 from app.services.subscription_service import (
     activate_pro_from_payment,
@@ -43,9 +53,7 @@ def list_payment_methods(
     amount: int = Query(default=PRO_SUBSCRIPTION_AMOUNT_IDR, description="Transaction amount in IDR"),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Returns the list of available payment methods for the active Duitku merchant.
-    Categories are derived from active methods only. Safe public data only.
-    """
+    """Returns the list of available payment methods for QRISGate gateway."""
     api_rate_limiter.check_or_raise(
         f"billing_methods:{current_user.id}",
         max_requests=60,
@@ -53,39 +61,14 @@ def list_payment_methods(
         error_detail="Too many payment method requests. Please wait before refreshing.",
     )
     enforced_amount = PRO_SUBSCRIPTION_AMOUNT_IDR
-    try:
-        methods = get_duitku_payment_methods(amount=enforced_amount)
-    except DuitkuConfigurationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "GATEWAY_CONFIG_ERROR", "message": str(exc)},
-        )
-    except DuitkuApiError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"code": "GATEWAY_API_ERROR", "message": str(exc)},
-        )
-
-    # Derive unique ordered categories that have at least one active method
-    seen_cats = set()
-    categories = []
-    category_order = ["virtual_account", "ewallet", "qr", "card", "retail", "paylater", "other"]
-    methods_by_cat = {m["category"]: m["category_label"] for m in methods}
-
-    for cat_key in category_order:
-        if cat_key in methods_by_cat and cat_key not in seen_cats:
-            seen_cats.add(cat_key)
-            categories.append({"key": cat_key, "label": methods_by_cat[cat_key]})
-
-    for cat_key, cat_label in methods_by_cat.items():
-        if cat_key not in seen_cats:
-            seen_cats.add(cat_key)
-            categories.append({"key": cat_key, "label": cat_label})
+    methods = get_qrisgate_payment_methods()
+    categories = [{"key": "qr", "label": "QR Payment"}]
 
     return {
         "payment_methods": methods,
         "categories": categories,
-        "provider_mode": get_duitku_mode(),
+        "provider": "qrisgate",
+        "provider_mode": "live",
         "base_amount": enforced_amount,
         "currency": "IDR",
     }
@@ -93,8 +76,12 @@ def list_payment_methods(
 
 class CheckoutRequest(BaseModel):
     plan: str = Field(default=PRO_PLAN_ID, description="Target plan ID ('pro')")
-    provider: str = Field(default="duitku", description="Payment provider adapter ('duitku')")
-    payment_method: str | None = Field(default="SP", description="Duitku payment method code (e.g. 'SP' for QRIS)")
+    provider: str = Field(default="qrisgate", description="Payment provider adapter ('qrisgate')")
+    payment_method: str | None = Field(default="QRIS", description="Payment method ('QRIS' or 'BANK_TRANSFER')")
+    bank_code: str | None = Field(default=None, description="Bank code if BANK_TRANSFER (e.g. 'BCA')")
+    customer_name: str | None = Field(default=None, description="Customer name")
+    return_url: str | None = Field(default=None, description="URL to return to after payment")
+    items: list[dict[str, Any]] | None = Field(default=None, description="Order items")
 
 
 def parse_iso_datetime(dt_str: str | None) -> datetime | None:
@@ -113,9 +100,9 @@ def create_checkout_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Creates a local pending payment transaction and requests a checkout session from Duitku.
+    """Creates a local pending payment transaction and requests a checkout session from QRISGate.
 
-    Xendit payment gateway has been retired from active checkout. Duitku is the sole active payment provider.
+    Duitku and Xendit payment gateways have been disabled. QRISGate is the sole active payment provider.
     Price and duration are authoritative on the backend (IDR 49,000 for 30 days).
     Client cannot supply custom amounts or duration.
     """
@@ -135,64 +122,30 @@ def create_checkout_session(
             },
         )
 
-    requested_provider = (payload.provider or "duitku").strip().lower()
-    if requested_provider != "duitku":
+    requested_provider = (payload.provider or "qrisgate").strip().lower()
+    if requested_provider in ("duitku", "xendit"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "code": "GATEWAY_DISABLED",
-                "message": "Xendit payment gateway has been retired. Duitku is the only active payment gateway.",
-            },
-        )
-
-    # Controlled Sandbox Checkout Protection:
-    if not is_user_allowed_sandbox_checkout(current_user):
-        logger.warning(
-            f"Blocked sandbox checkout attempt for non-allowlisted user {current_user.id} ({current_user.email})"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "SANDBOX_CHECKOUT_RESTRICTED",
                 "message": (
-                    "Pembelian paket Pro saat ini beroperasi dalam mode Sandbox tertutup (internal testing) "
-                    "dan belum dibuka untuk umum. Hubungi tim dukungan di support@raytech.cloud untuk "
-                    "permohonan akses pengujian."
+                    f"Gateway pembayaran '{requested_provider}' telah dinonaktifkan. "
+                    "QRISGate adalah gateway pembayaran aktif."
                 ),
             },
         )
 
-    # 1. Validate requested payment method against active Duitku methods
-    requested_method = (payload.payment_method or "SP").strip()
-    try:
-        available_methods = get_duitku_payment_methods(amount=PRO_SUBSCRIPTION_AMOUNT_IDR)
-        active_codes = {m["code"] for m in available_methods if m.get("active", True)}
-        if active_codes and requested_method not in active_codes:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": "PAYMENT_METHOD_UNAVAILABLE",
-                    "message": f"Payment method '{requested_method}' is currently not available for this merchant.",
-                },
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning(f"Could not pre-validate payment method availability with Duitku: {exc}")
+    requested_method = (payload.payment_method or "QRIS").strip().upper()
 
-    # 2. Idempotency protection against rapid repeated clicks:
-    # If a pending transaction exists created within last 15 minutes for Duitku with same payment method and valid checkout_url, reuse it.
+    # 1. Idempotency protection:
+    # If a pending transaction exists created within last 15 minutes for QRISGate with valid checkout_url, reuse it.
     fifteen_mins_ago = utcnow() - timedelta(minutes=15)
     existing_pending = db.scalar(
         select(PaymentTransaction)
         .where(
             PaymentTransaction.user_id == current_user.id,
             PaymentTransaction.status == "PENDING",
-            PaymentTransaction.provider == "duitku",
-            or_(
-                PaymentTransaction.payment_method == requested_method,
-                PaymentTransaction.payment_method.is_(None) if requested_method == "SP" else False,
-            ),
+            PaymentTransaction.provider == "qrisgate",
             PaymentTransaction.created_at >= fifteen_mins_ago,
             PaymentTransaction.checkout_url.isnot(None),
         )
@@ -201,8 +154,18 @@ def create_checkout_session(
     )
 
     if existing_pending and existing_pending.checkout_url:
-        logger.info(f"Reusing active pending checkout tx {existing_pending.id} for user {current_user.id} ({requested_method})")
+        logger.info(f"Reusing active pending checkout tx {existing_pending.id} for user {current_user.id}")
+        data_obj = {
+            "checkout_url": existing_pending.checkout_url,
+            "total_amount": existing_pending.total_amount or existing_pending.amount,
+            "unique_code": existing_pending.unique_code or 0,
+            "qr_string": existing_pending.qr_string,
+            "expires_at": existing_pending.expires_at.isoformat() if existing_pending.expires_at else None,
+            "external_order_id": existing_pending.external_id,
+            "id": existing_pending.provider_payment_id or existing_pending.id,
+        }
         return {
+            "data": data_obj,
             "transaction_id": existing_pending.id,
             "external_id": existing_pending.external_id,
             "provider": existing_pending.provider,
@@ -210,28 +173,29 @@ def create_checkout_session(
             "payment_method": existing_pending.payment_method,
             "payment_channel": existing_pending.payment_channel,
             "checkout_url": existing_pending.checkout_url,
-            "va_number": getattr(existing_pending, "va_number", None),
             "qr_string": existing_pending.qr_string,
             "amount": existing_pending.amount,
+            "total_amount": existing_pending.total_amount or existing_pending.amount,
+            "unique_code": existing_pending.unique_code or 0,
             "currency": existing_pending.currency,
             "status": existing_pending.status,
             "expires_at": existing_pending.expires_at.isoformat() if existing_pending.expires_at else None,
         }
 
-    # 3. Determine mode and unique external order reference
-    external_id = generate_duitku_order_id(current_user.id)
-    provider_mode = get_duitku_mode()
+    # 2. Generate unique external order reference
+    external_id = generate_qrisgate_order_id(current_user.id)
 
-    # 4. Create local pending transaction record
+    # 3. Create local pending transaction record (authoritative price: IDR 49,000)
     tx = PaymentTransaction(
         user_id=current_user.id,
         plan=PRO_PLAN_ID,
         amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
         currency="IDR",
         status="PENDING",
-        provider="duitku",
-        provider_mode=provider_mode,
+        provider="qrisgate",
+        provider_mode="live",
         payment_method=requested_method,
+        payment_channel="qrisgate",
         external_id=external_id,
         created_at=utcnow(),
         updated_at=utcnow(),
@@ -240,23 +204,44 @@ def create_checkout_session(
     db.commit()
     db.refresh(tx)
 
-    # 5. Initiate provider checkout via Duitku
+    # 4. Initiate provider checkout via QRISGate API
     try:
-        data = create_duitku_transaction(
-            merchant_order_id=tx.external_id,
+        effective_return_url = payload.return_url or f"{get_frontend_url()}/order/{tx.external_id}"
+        qrg_resp = create_qrisgate_transaction(
+            external_order_id=tx.external_id,
             amount=tx.amount,
-            payer_email=current_user.email,
-            customer_name=current_user.name or "Raytech Subscriber",
+            customer_name=payload.customer_name or current_user.name or "Raytech Subscriber",
+            return_url=effective_return_url,
             payment_method=requested_method,
+            bank_code=payload.bank_code,
         )
-    except DuitkuConfigurationError as exc:
+    except QRISGateInsufficientCreditError as exc:
+        tx.status = "FAILED"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "MERCHANT_CREDIT_EXHAUSTED", "message": str(exc)},
+        )
+    except QRISGateValidationError as exc:
+        tx.status = "FAILED"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "GATEWAY_VALIDATION_ERROR", "message": str(exc)},
+        )
+    except QRISGateRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "GATEWAY_RATE_LIMIT", "message": str(exc)},
+        )
+    except QRISGateConfigurationError as exc:
         tx.status = "FAILED"
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "GATEWAY_CONFIG_ERROR", "message": str(exc)},
         )
-    except DuitkuApiError as exc:
+    except QRISGateApiError as exc:
         tx.status = "FAILED"
         db.commit()
         raise HTTPException(
@@ -264,18 +249,32 @@ def create_checkout_session(
             detail={"code": "GATEWAY_API_ERROR", "message": str(exc)},
         )
 
-    tx.provider_payment_id = data.get("reference")
-    tx.checkout_url = data.get("paymentUrl")
-    tx.qr_string = data.get("qrString")
-    tx.va_number = data.get("vaNumber")
-    tx.payment_method = requested_method
-    tx.payment_channel = "duitku"
-    tx.expires_at = utcnow() + timedelta(hours=24)
+    # 5. Persist provider metadata
+    tx.provider_payment_id = qrg_resp.get("id")
+    tx.checkout_url = qrg_resp.get("checkout_url")
+    tx.qr_string = qrg_resp.get("qr_string")
+    tx.total_amount = qrg_resp.get("total_amount")
+    tx.unique_code = qrg_resp.get("unique_code")
+
+    raw_exp = qrg_resp.get("expires_at")
+    parsed_exp = parse_iso_datetime(raw_exp) if raw_exp else None
+    tx.expires_at = parsed_exp or (utcnow() + timedelta(minutes=15))
     tx.updated_at = utcnow()
     db.commit()
     db.refresh(tx)
 
+    data_obj = {
+        "checkout_url": tx.checkout_url,
+        "total_amount": tx.total_amount or tx.amount,
+        "unique_code": tx.unique_code or 0,
+        "qr_string": tx.qr_string,
+        "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
+        "external_order_id": tx.external_id,
+        "id": tx.provider_payment_id or tx.id,
+    }
+
     return {
+        "data": data_obj,
         "transaction_id": tx.id,
         "external_id": tx.external_id,
         "provider": tx.provider,
@@ -283,9 +282,10 @@ def create_checkout_session(
         "payment_method": tx.payment_method,
         "payment_channel": tx.payment_channel,
         "checkout_url": tx.checkout_url,
-        "va_number": tx.va_number,
         "qr_string": tx.qr_string,
         "amount": tx.amount,
+        "total_amount": tx.total_amount or tx.amount,
+        "unique_code": tx.unique_code or 0,
         "currency": tx.currency,
         "status": tx.status,
         "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
@@ -327,6 +327,8 @@ def list_user_transactions(
             "provider_mode": tx.provider_mode,
             "plan": tx.plan,
             "amount": tx.amount,
+            "total_amount": tx.total_amount or tx.amount,
+            "unique_code": tx.unique_code or 0,
             "currency": tx.currency,
             "status": tx.status,
             "payment_method": tx.payment_method,
@@ -370,6 +372,8 @@ def get_transaction_detail(
         "provider_mode": tx.provider_mode,
         "plan": tx.plan,
         "amount": tx.amount,
+        "total_amount": tx.total_amount or tx.amount,
+        "unique_code": tx.unique_code or 0,
         "currency": tx.currency,
         "status": tx.status,
         "payment_method": tx.payment_method,
@@ -416,9 +420,19 @@ def get_transaction_status(
 
     now = utcnow()
     # Reconcile authoritatively if PENDING and credentials exist.
-    # Throttle external calls to Duitku to at most once every 10 seconds per transaction unless sync is requested
     if tx.status == "PENDING":
-        if tx.provider == "duitku" and bool(get_duitku_api_key()):
+        if tx.provider == "qrisgate" and bool(get_qrisgate_api_key()):
+            tx_updated = ensure_utc(tx.updated_at)
+            seconds_since_update = (now - tx_updated).total_seconds() if tx_updated else 999.0
+            if sync or seconds_since_update >= 2.0:
+                try:
+                    reconcile_and_process_payment(db=db, transaction_id=tx.id)
+                    db.refresh(tx)
+                except Exception as err:
+                    logger.warning(f"Authoritative QRISGate reconciliation skipped during polling for tx {tx.id}: {err}")
+                    tx.updated_at = now
+                    db.commit()
+        elif tx.provider == "duitku" and bool(get_duitku_api_key()):
             tx_updated = ensure_utc(tx.updated_at)
             seconds_since_update = (now - tx_updated).total_seconds() if tx_updated else 999.0
             if sync or seconds_since_update >= 10.0:
@@ -448,6 +462,8 @@ def get_transaction_status(
         "status": tx.status,
         "plan": tx.plan,
         "amount": tx.amount,
+        "total_amount": tx.total_amount or tx.amount,
+        "unique_code": tx.unique_code or 0,
         "currency": tx.currency,
         "payment_method": tx.payment_method,
         "payment_channel": tx.payment_channel,
@@ -457,4 +473,70 @@ def get_transaction_status(
         "paid_at": tx.paid_at.isoformat() if tx.paid_at else None,
         "is_pro_active": effective_plan == PRO_PLAN_ID,
         "current_period_end": sub.current_period_end.isoformat() if (sub and sub.current_period_end) else None,
+    }
+
+
+@router.get("/order/{order_id}", summary="Get order details by external order ID or transaction ID")
+def get_order_by_id(
+    order_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Retrieves order status by transaction ID or external order ID with authoritative QRISGate reconciliation."""
+    tx = None
+    if order_id.isdigit():
+        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == int(order_id)))
+    if not tx:
+        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.external_id == order_id))
+    if not tx:
+        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.provider_payment_id == order_id))
+
+    if not tx:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found.",
+        )
+
+    # If pending, try to sync authoritatively with QRISGate
+    if tx.status == "PENDING" and tx.provider == "qrisgate" and bool(get_qrisgate_api_key()):
+        try:
+            reconcile_and_process_payment(db=db, transaction_id=tx.id)
+            db.refresh(tx)
+        except Exception as err:
+            logger.warning(f"Error syncing order {order_id} with QRISGate: {err}")
+
+    effective_plan, _ = get_effective_plan(db, tx.user_id)
+
+    data_obj = {
+        "id": tx.provider_payment_id or str(tx.id),
+        "transaction_id": tx.id,
+        "external_order_id": tx.external_id,
+        "status": tx.status,
+        "amount": tx.amount,
+        "total_amount": tx.total_amount or tx.amount,
+        "unique_code": tx.unique_code or 0,
+        "currency": tx.currency,
+        "plan": tx.plan,
+        "checkout_url": tx.checkout_url,
+        "qr_string": tx.qr_string,
+        "paid_at": tx.paid_at.isoformat() if tx.paid_at else None,
+        "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
+        "is_pro_active": effective_plan == PRO_PLAN_ID,
+    }
+
+    return {
+        "data": data_obj,
+        "id": tx.id,
+        "external_id": tx.external_id,
+        "external_order_id": tx.external_id,
+        "status": tx.status,
+        "amount": tx.amount,
+        "total_amount": tx.total_amount or tx.amount,
+        "unique_code": tx.unique_code or 0,
+        "currency": tx.currency,
+        "plan": tx.plan,
+        "checkout_url": tx.checkout_url,
+        "qr_string": tx.qr_string,
+        "paid_at": tx.paid_at.isoformat() if tx.paid_at else None,
+        "expires_at": tx.expires_at.isoformat() if tx.expires_at else None,
+        "is_pro_active": effective_plan == PRO_PLAN_ID,
     }
