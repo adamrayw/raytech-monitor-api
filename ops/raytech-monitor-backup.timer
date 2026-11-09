@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Raytech Monitor database backup at 02:30 Asia/Jakarta
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Jakarta
+Persistent=true
+Unit=raytech-monitor-backup.service
+
+[Install]
+WantedBy=timers.target

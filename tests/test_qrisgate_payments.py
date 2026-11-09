@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -33,6 +34,7 @@ from app.services.qrisgate_service import (
     verify_qrisgate_timestamp,
     verify_qrisgate_webhook_signature,
 )
+from app.services.payment_service import reconcile_and_process_payment
 from app.services.subscription_service import get_effective_plan, utcnow
 
 TEST_API_KEY = "qg_live_test_api_key_secret_abcdef123456"
@@ -264,15 +266,24 @@ def test_webhook_payment_paid_fulfillment(db, qrisgate_client, qrisgate_user):
     sig = hmac.new(TEST_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     ts = str(int(time.time()))
 
-    resp = qrisgate_client.post(
-        "/api/webhooks/qrisgate",
-        content=raw_body,
-        headers={
-            "content-type": "application/json",
-            "x-qrisgate-signature": sig,
-            "x-qrisgate-timestamp": ts,
-        },
-    )
+    authoritative = {
+        "id": "tx_qrg_999",
+        "external_order_id": external_order_id,
+        "status": "PAID",
+        "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "currency": "IDR",
+        "paid_at": payload["data"]["paid_at"],
+    }
+    with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):
+        resp = qrisgate_client.post(
+            "/api/webhooks/qrisgate",
+            content=raw_body,
+            headers={
+                "content-type": "application/json",
+                "x-qrisgate-signature": sig,
+                "x-qrisgate-timestamp": ts,
+            },
+        )
 
     assert resp.status_code == 200
     assert resp.json().get("status") == "ok"
@@ -332,16 +343,25 @@ def test_webhook_idempotency_duplicate_event(db, qrisgate_client, qrisgate_user)
         "x-qrisgate-timestamp": ts,
     }
 
-    # First attempt: succeeds and fulfills
-    resp1 = qrisgate_client.post("/api/webhooks/qrisgate", content=raw_body, headers=headers)
-    assert resp1.status_code == 200
+    authoritative = {
+        "id": "tx_qrg_888",
+        "external_order_id": external_order_id,
+        "status": "PAID",
+        "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "currency": "IDR",
+        "paid_at": payload["data"]["paid_at"],
+    }
+    with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):
+        # First attempt: succeeds and fulfills
+        resp1 = qrisgate_client.post("/api/webhooks/qrisgate", content=raw_body, headers=headers)
+        assert resp1.status_code == 200
 
-    db.refresh(tx)
-    assert tx.status == "PAID"
-    first_paid_at = tx.paid_at
+        db.refresh(tx)
+        assert tx.status == "PAID"
+        first_paid_at = tx.paid_at
 
-    # Second attempt: same event_id, must return 200 instantly as already processed
-    resp2 = qrisgate_client.post("/api/webhooks/qrisgate", content=raw_body, headers=headers)
+        # Second attempt: same event_id, must return 200 instantly as already processed
+        resp2 = qrisgate_client.post("/api/webhooks/qrisgate", content=raw_body, headers=headers)
     assert resp2.status_code == 200
     assert resp2.json().get("status") == "already_processed"
 
@@ -390,8 +410,10 @@ def test_checkout_endpoint_success(db, qrisgate_client, qrisgate_user):
     )
     assert tx is not None
     assert tx.status == "PENDING"
+    assert tx.paid_at is None
     assert tx.amount == PRO_SUBSCRIPTION_AMOUNT_IDR
     assert tx.provider == "qrisgate"
+    assert tx.revenue_classification == "REAL"
     assert tx.total_amount == 49005
     assert tx.unique_code == 5
 
@@ -466,8 +488,8 @@ def test_order_polling_reconciliation(db, qrisgate_client, qrisgate_user):
         "external_order_id": external_order_id,
         "status": "PAID",
         "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
-        "total_amount": PRO_SUBSCRIPTION_AMOUNT_IDR + 7,
-        "unique_code": 7,
+        "total_amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "unique_code": 0,
         "paid_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -483,3 +505,131 @@ def test_order_polling_reconciliation(db, qrisgate_client, qrisgate_user):
     db.refresh(tx)
     assert tx.status == "PAID"
     assert tx.paid_at is not None
+
+
+def test_authoritative_amount_mismatch_is_rejected(db, qrisgate_user):
+    tx = PaymentTransaction(
+        user_id=qrisgate_user.id,
+        plan="pro",
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="qrisgate",
+        external_id="qrg_amount_mismatch",
+        provider_payment_id="tx_qrg_amount_mismatch",
+    )
+    db.add(tx)
+    db.commit()
+
+    authoritative = {
+        "id": tx.provider_payment_id,
+        "external_order_id": tx.external_id,
+        "status": "PAID",
+        "amount": 1000,
+        "currency": "IDR",
+    }
+    with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):
+        with pytest.raises(HTTPException) as exc_info:
+            reconcile_and_process_payment(db, tx.id)
+
+    assert exc_info.value.status_code == 422
+    db.refresh(tx)
+    assert tx.status == "PENDING"
+    assert get_effective_plan(db, qrisgate_user.id)[0] == "free"
+
+
+def test_authoritative_identity_mismatch_is_rejected(db, qrisgate_user):
+    tx = PaymentTransaction(
+        user_id=qrisgate_user.id,
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="qrisgate",
+        external_id="qrg_identity_expected",
+        provider_payment_id="tx_qrg_identity_expected",
+    )
+    db.add(tx)
+    db.commit()
+
+    authoritative = {
+        "id": tx.provider_payment_id,
+        "external_order_id": "qrg_identity_other",
+        "status": "PAID",
+        "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "currency": "IDR",
+    }
+    with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):
+        with pytest.raises(HTTPException) as exc_info:
+            reconcile_and_process_payment(db, tx.id)
+
+    assert exc_info.value.status_code == 422
+    db.refresh(tx)
+    assert tx.status == "PENDING"
+
+
+def test_provider_lookup_failure_does_not_trust_paid_webhook(db, qrisgate_client, qrisgate_user):
+    tx = PaymentTransaction(
+        user_id=qrisgate_user.id,
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="qrisgate",
+        external_id="qrg_fail_closed",
+        provider_payment_id="tx_qrg_fail_closed",
+    )
+    db.add(tx)
+    db.commit()
+    transaction_id = tx.id
+    payload = {
+        "event_id": "evt_qrg_fail_closed",
+        "event": "payment.paid",
+        "data": {"id": tx.provider_payment_id, "external_order_id": tx.external_id},
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+    signature = hmac.new(TEST_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+
+    with patch(
+        "app.services.payment_service.get_qrisgate_transaction",
+        side_effect=QRISGateApiError("provider unavailable", status_code=502),
+    ):
+        response = qrisgate_client.post(
+            "/api/webhooks/qrisgate",
+            content=raw_body,
+            headers={
+                "content-type": "application/json",
+                "x-qrisgate-signature": signature,
+                "x-qrisgate-timestamp": str(int(time.time())),
+            },
+        )
+
+    assert response.status_code == 502
+    persisted = db.get(PaymentTransaction, transaction_id)
+    assert persisted is None or persisted.status == "PENDING"
+    assert db.scalar(select(EmailDelivery.id)) is None
+
+
+def test_failed_authoritative_payment_does_not_activate_pro(db, qrisgate_user):
+    tx = PaymentTransaction(
+        user_id=qrisgate_user.id,
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        currency="IDR",
+        status="PENDING",
+        provider="qrisgate",
+        external_id="qrg_failed_payment",
+        provider_payment_id="tx_qrg_failed_payment",
+    )
+    db.add(tx)
+    db.commit()
+    authoritative = {
+        "id": tx.provider_payment_id,
+        "external_order_id": tx.external_id,
+        "status": "FAILED",
+        "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "currency": "IDR",
+    }
+
+    with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):
+        outcome, _ = reconcile_and_process_payment(db, tx.id)
+
+    assert outcome == "failed"
+    assert get_effective_plan(db, qrisgate_user.id)[0] == "free"

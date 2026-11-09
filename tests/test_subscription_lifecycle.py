@@ -202,8 +202,8 @@ def test_fail_safe_effective_plan_downgrades_when_worker_delayed(db, non_legacy_
 
     plan_id, fresh_sub = get_effective_plan(db, non_legacy_user.id)
     assert plan_id == "free"
-    assert fresh_sub.plan == "free"
-    assert fresh_sub.status == "expired"
+    assert fresh_sub.plan == "pro"
+    assert fresh_sub.status == "active"
 
 
 def test_legacy_override_protected_from_expiration(db, test_user):

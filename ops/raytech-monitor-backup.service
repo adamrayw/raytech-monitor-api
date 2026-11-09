@@ -1,0 +1,15 @@
+[Unit]
+Description=Back up the Raytech Monitor PostgreSQL database
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=-/etc/raytech-monitor/backup.env
+ExecStart=/usr/local/sbin/backup-monitor-db
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true

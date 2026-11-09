@@ -475,15 +475,15 @@ def test_rate_limiting_billing_checkout(client, test_user):
     try:
         app.dependency_overrides[get_current_user] = lambda: test_user
 
-        mock_duitku_resp = {
-            "statusCode": "00",
-            "statusMessage": "SUCCESS",
-            "reference": "DTK_RATE_LIMIT",
-            "paymentUrl": "https://sandbox.duitku.com/pay",
-            "qrString": "mock_qr",
-            "amount": "49000",
+        mock_qrisgate_response = {
+            "id": "qrg_rate_limit",
+            "checkout_url": "https://qrisgate.web.id/pay/rate-limit",
+            "qr_string": "mock_qr",
+            "total_amount": 49000,
+            "unique_code": 0,
+            "expires_at": None,
         }
-        with patch("app.routes.billing.create_duitku_transaction", return_value=mock_duitku_resp):
+        with patch("app.routes.billing.create_qrisgate_transaction", return_value=mock_qrisgate_response):
             for _ in range(10):
                 client.post("/billing/checkout", json={"plan": "pro"})
 

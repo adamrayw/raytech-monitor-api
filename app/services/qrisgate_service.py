@@ -77,6 +77,11 @@ def get_qrisgate_webhook_secret() -> str:
     return os.environ.get("QRISGATE_WEBHOOK_SECRET", "").strip()
 
 
+def get_qrisgate_merchant_id() -> str:
+    """Returns the expected merchant identifier when QRISGate exposes one."""
+    return os.environ.get("QRISGATE_MERCHANT_ID", "").strip()
+
+
 def validate_qrisgate_environment() -> None:
     """Validates that essential QRISGate credentials exist."""
     api_key = get_qrisgate_api_key()
@@ -209,7 +214,7 @@ def _execute_qrisgate_request_with_retry(
 
             # Handle Bad Request / Validation Failure (400)
             if response.status_code == 400:
-                logger.error(f"QRISGate validation error (400): {response.text}")
+                logger.error("QRISGate validation error (HTTP 400)")
                 try:
                     err_json = response.json()
                     err_msg = err_json.get("message") or err_json.get("error") or "Validation error from QRISGate"
@@ -228,7 +233,7 @@ def _execute_qrisgate_request_with_retry(
 
             # Raise for any other 4xx/5xx status
             if response.is_error:
-                logger.error(f"QRISGate HTTP {response.status_code} error: {response.text}")
+                logger.error("QRISGate HTTP error: status=%s", response.status_code)
                 raise QRISGateApiError(
                     message=f"QRISGate API returned status {response.status_code}",
                     status_code=response.status_code,
@@ -248,12 +253,12 @@ def _execute_qrisgate_request_with_retry(
             raise
         except httpx.RequestError as exc:
             if attempt < max_retries:
-                logger.warning(f"QRISGate network error on attempt {attempt}: {exc}. Retrying...")
+                logger.warning("QRISGate network error on attempt %s; retrying", attempt)
                 time.sleep(backoff)
                 backoff *= 2.0
                 continue
             raise QRISGateApiError(
-                message=f"Network error communicating with QRISGate: {exc}",
+                message="Network error communicating with QRISGate",
                 status_code=502,
             )
 
@@ -404,6 +409,8 @@ def get_qrisgate_transaction(transaction_id_or_external_id: str | int) -> dict[s
         "raw_status": raw_status,
         "amount": inner.get("amount"),
         "total_amount": inner.get("total_amount"),
+        "currency": inner.get("currency"),
+        "merchant_id": inner.get("merchant_id") or inner.get("merchant_code"),
         "unique_code": inner.get("unique_code"),
         "checkout_url": inner.get("checkout_url"),
         "qr_string": inner.get("qr_string"),

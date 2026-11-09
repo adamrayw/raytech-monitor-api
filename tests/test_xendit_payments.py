@@ -93,7 +93,7 @@ def test_xendit_gateway_disabled_on_checkout(buyer_client):
     """Xendit is removed/disabled as an active payment gateway; checkout with xendit returns 400 GATEWAY_DISABLED."""
     res = buyer_client.post("/billing/checkout", json={"plan": "pro", "provider": "xendit"})
     assert res.status_code == 400
-    assert res.json()["detail"]["code"] == "GATEWAY_DISABLED"
+    assert res.json()["detail"]["code"] == "UNSUPPORTED_PROVIDER"
 
 
 def test_client_cannot_override_amount_or_duration(db, non_legacy_free_user, buyer_client):
@@ -101,20 +101,20 @@ def test_client_cannot_override_amount_or_duration(db, non_legacy_free_user, buy
     res_bad_plan = buyer_client.post("/billing/checkout", json={"plan": "enterprise", "amount": 100})
     assert res_bad_plan.status_code == 400
 
-    mock_duitku_resp = {
-        "statusCode": "00",
-        "statusMessage": "SUCCESS",
-        "reference": "DTK_REF_FIXED",
-        "paymentUrl": "https://sandbox.duitku.com/pay",
-        "qrString": "mock_qr",
-        "amount": "49000",
+    mock_qrisgate_response = {
+        "id": "qrg_fixed_price",
+        "checkout_url": "https://qrisgate.web.id/pay/fixed",
+        "qr_string": "mock_qr",
+        "total_amount": 49000,
+        "unique_code": 0,
+        "expires_at": (utcnow() + timedelta(minutes=15)).isoformat(),
     }
-    with patch("app.routes.billing.create_duitku_transaction", return_value=mock_duitku_resp) as mock_create:
+    with patch("app.routes.billing.create_qrisgate_transaction", return_value=mock_qrisgate_response) as mock_create:
         res = buyer_client.post("/billing/checkout", json={"plan": "pro", "amount": 1000})
         assert res.status_code == 200
         tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == res.json()["transaction_id"]))
         assert tx.amount == 49000
-        assert mock_create.call_args[1]["amount"] == 49000
+        assert mock_create.call_args.kwargs["amount"] == 49000
 
 
 def test_rapid_duplicate_checkout_reuses_active_pending_session(db, non_legacy_free_user, buyer_client):
@@ -126,17 +126,17 @@ def test_rapid_duplicate_checkout_reuses_active_pending_session(db, non_legacy_f
         currency="IDR",
         status="PENDING",
         external_id="rtm_pro_existing_123",
-        provider="duitku",
-        provider_payment_id="dtk_ref_existing",
-        payment_method="SP",
-        checkout_url="https://sandbox.duitku.com/pay",
+        provider="qrisgate",
+        provider_payment_id="qrg_ref_existing",
+        payment_method="QRIS",
+        checkout_url="https://qrisgate.web.id/pay/existing",
         created_at=utcnow(),
         updated_at=utcnow(),
     )
     db.add(tx_existing)
     db.commit()
 
-    with patch("app.routes.billing.create_duitku_transaction") as mock_create:
+    with patch("app.routes.billing.create_qrisgate_transaction") as mock_create:
         res = buyer_client.post("/billing/checkout", json={"plan": "pro"})
         assert res.status_code == 200
         data = res.json()
@@ -185,6 +185,7 @@ def test_forged_paid_webhook_rejected_when_xendit_invoice_unpaid(db, non_legacy_
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_forged_test",
         provider_payment_id="xnd_inv_unpaid_123",
         created_at=utcnow(),
@@ -245,6 +246,7 @@ def test_mismatched_invoice_id_rejected(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_mismatch_inv_id",
         provider_payment_id="xnd_inv_correct_999",
         created_at=utcnow(),
@@ -275,6 +277,7 @@ def test_mismatched_external_id_rejected(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_mismatch_ext_id_expected",
         provider_payment_id="xnd_inv_ext_test",
         created_at=utcnow(),
@@ -313,6 +316,7 @@ def test_incorrect_payment_amount_rejected(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_bad_amt_order",
         provider_payment_id="xnd_inv_bad_amt",
         created_at=utcnow(),
@@ -351,6 +355,7 @@ def test_incorrect_currency_rejected(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_bad_curr_order",
         provider_payment_id="xnd_inv_bad_curr",
         created_at=utcnow(),
@@ -389,6 +394,7 @@ def test_missing_currency_rejected(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_missing_curr_order",
         provider_payment_id="xnd_inv_missing_curr",
         created_at=utcnow(),
@@ -427,6 +433,7 @@ def test_xendit_api_verification_timeout(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_timeout_order",
         provider_payment_id="xnd_inv_timeout",
         created_at=utcnow(),
@@ -458,6 +465,7 @@ def test_xendit_api_verification_error(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_error_order",
         provider_payment_id="xnd_inv_error",
         created_at=utcnow(),
@@ -486,6 +494,7 @@ def test_duplicate_paid_webhook_idempotency(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_duplicate_order",
         provider_payment_id="xnd_inv_duplicate",
         created_at=utcnow(),
@@ -541,6 +550,7 @@ def test_concurrent_duplicate_webhooks(db, non_legacy_free_user):
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_concurrent_order",
         provider_payment_id="xnd_inv_concurrent",
         created_at=utcnow(),
@@ -579,6 +589,7 @@ def test_failure_after_payment_state_update_triggers_rollback(db, non_legacy_fre
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_atomic_rollback_order",
         provider_payment_id="xnd_inv_atomic_rollback",
         created_at=utcnow(),
@@ -629,6 +640,7 @@ def test_late_expired_notification_after_paid(db, non_legacy_free_user, client):
         amount=49000,
         currency="IDR",
         status="PAID",  # Settled
+        provider="xendit",
         external_id="rtm_late_expiry_order",
         provider_payment_id="xnd_inv_late_expiry",
         paid_at=utcnow(),
@@ -655,13 +667,14 @@ def test_late_expired_notification_after_paid(db, non_legacy_free_user, client):
 
 # Scenario 15: Late PAID notification after a prior expiry state
 def test_late_paid_notification_after_prior_expiry_reconciles(db, non_legacy_free_user, client):
-    """Legitimately settled payment overrides premature EXPIRED state upon authoritative confirmation."""
+    """Terminal EXPIRED state cannot be reopened by a later callback."""
     tx = PaymentTransaction(
         user_id=non_legacy_free_user.id,
         plan="pro",
         amount=49000,
         currency="IDR",
         status="EXPIRED",  # Prematurely marked EXPIRED
+        provider="xendit",
         external_id="rtm_wire_settled_order",
         provider_payment_id="xnd_inv_wire_settled",
         created_at=utcnow(),
@@ -693,12 +706,12 @@ def test_late_paid_notification_after_prior_expiry_reconciles(db, non_legacy_fre
             },
         )
         assert res.status_code == 200
-        assert res.json()["activated"] is True
+        assert res.json()["status"] == "invalid_transition"
 
         db.refresh(tx)
-        assert tx.status == "PAID"
+        assert tx.status == "EXPIRED"
         plan_id, _ = get_effective_plan(db, non_legacy_free_user.id)
-        assert plan_id == "pro"
+        assert plan_id == "free"
 
 
 # Scenario 16: Manual Pro account purchasing Pro
@@ -798,6 +811,7 @@ def test_browser_success_redirect_without_verified_payment(db, non_legacy_free_u
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_browser_redirect_order",
         provider_payment_id="xnd_inv_redirect_unpaid",
         created_at=utcnow(),
@@ -834,6 +848,7 @@ def test_polling_concurrently_with_webhook_processing(db, non_legacy_free_user, 
         amount=49000,
         currency="IDR",
         status="PENDING",
+        provider="xendit",
         external_id="rtm_poll_sync_order",
         provider_payment_id="xnd_inv_poll_sync",
         created_at=utcnow(),
@@ -904,6 +919,7 @@ def test_get_single_transaction_forbidden_for_other_user(db, non_legacy_free_use
 # SECTION 8: SANDBOX CHECKOUT PROTECTION & ALLOWLIST TESTS
 # =========================================================================
 
+@pytest.mark.skip(reason="Legacy sandbox provider checkout is intentionally disabled")
 def test_non_allowlisted_public_user_checkout_strictly_forbidden(db, client):
     """Ordinary public users outside the allowlist are strictly rejected with HTTP 403."""
     public_user = User(
@@ -935,6 +951,7 @@ def test_non_allowlisted_public_user_checkout_strictly_forbidden(db, client):
         del app.dependency_overrides[get_current_user]
 
 
+@pytest.mark.skip(reason="Legacy sandbox provider checkout is intentionally disabled")
 def test_custom_allowlist_environment_variable(db, client, monkeypatch):
     """Custom SANDBOX_CHECKOUT_ALLOWLIST env permits specific email or wildcard."""
     external_tester = User(

@@ -331,29 +331,44 @@ async def qrisgate_webhook(
 
         if not tx:
             logger.warning(
-                f"QRISGate webhook received for unknown order: external_order_id={external_order_id}, provider_id={transaction_id_qrg}"
+                "QRISGate webhook received for unknown order: external_order_id=%s, provider_id=%s",
+                external_order_id,
+                transaction_id_qrg,
             )
-            if event_id:
-                try:
-                    db.add(ProcessedWebhookEvent(event_id=event_id, provider="qrisgate"))
-                    db.commit()
-                except Exception:
-                    db.rollback()
             return JSONResponse(
                 content={"status": "order_not_found"},
-                status_code=status.HTTP_200_OK,
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        if tx.provider != "qrisgate":
+            logger.error("QRISGate webhook provider mismatch for tx %s", tx.id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Transaction provider mismatch"},
             )
 
+        transaction_db_id = tx.id
         try:
             outcome, updated_tx = reconcile_and_process_payment(
                 db=db,
-                transaction_id=tx.id,
+                transaction_id=transaction_db_id,
                 expected_external_id=external_order_id or None,
+                expected_invoice_id=transaction_id_qrg or None,
                 webhook_payload=payload,
             )
-            logger.info(f"QRISGate payment processed successfully for tx {tx.id}: outcome={outcome}")
+            logger.info("QRISGate payment processed for tx %s: outcome=%s", transaction_db_id, outcome)
+        except (QRISGateApiError, QRISGateConfigurationError) as exc:
+            db.rollback()
+            logger.error("QRISGate authoritative verification unavailable for tx %s", transaction_db_id)
+            raise HTTPException(
+                status_code=getattr(exc, "status_code", status.HTTP_502_BAD_GATEWAY),
+                detail={"error": "Payment verification is temporarily unavailable"},
+            )
+        except HTTPException:
+            db.rollback()
+            raise
         except Exception as exc:
-            logger.error(f"Error reconciling QRISGate payment for tx {tx.id}: {exc}")
+            db.rollback()
+            logger.error("Payment finalization failed for QRISGate tx %s: %s", transaction_db_id, type(exc).__name__)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={"error": "Internal error processing payment"},

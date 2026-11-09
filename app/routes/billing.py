@@ -184,6 +184,7 @@ def create_checkout_session(
         status="PENDING",
         provider="qrisgate",
         provider_mode="live",
+        revenue_classification="REAL",
         payment_method=requested_method,
         payment_channel="qrisgate",
         external_id=external_id,
@@ -196,7 +197,7 @@ def create_checkout_session(
 
     # 4. Initiate provider checkout via QRISGate API
     try:
-        effective_return_url = payload.return_url or f"{get_frontend_url()}/order/{tx.external_id}"
+        effective_return_url = f"{get_frontend_url()}/order/{tx.external_id}"
         qrg_resp = create_qrisgate_transaction(
             external_order_id=tx.external_id,
             amount=tx.amount,
@@ -470,15 +471,37 @@ def get_transaction_status(
 def get_order_by_id(
     order_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Retrieves order status by transaction ID or external order ID with authoritative QRISGate reconciliation."""
+    """Retrieves an authenticated user's order status and reconciles it when pending."""
+    api_rate_limiter.check_or_raise(
+        f"billing_order:{current_user.id}",
+        max_requests=60,
+        window_seconds=60.0,
+        error_detail="Too many order status requests. Please wait before polling again.",
+    )
     tx = None
     if order_id.isdigit():
-        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == int(order_id)))
+        tx = db.scalar(
+            select(PaymentTransaction).where(
+                PaymentTransaction.id == int(order_id),
+                PaymentTransaction.user_id == current_user.id,
+            )
+        )
     if not tx:
-        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.external_id == order_id))
+        tx = db.scalar(
+            select(PaymentTransaction).where(
+                PaymentTransaction.external_id == order_id,
+                PaymentTransaction.user_id == current_user.id,
+            )
+        )
     if not tx:
-        tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.provider_payment_id == order_id))
+        tx = db.scalar(
+            select(PaymentTransaction).where(
+                PaymentTransaction.provider_payment_id == order_id,
+                PaymentTransaction.user_id == current_user.id,
+            )
+        )
 
     if not tx:
         raise HTTPException(

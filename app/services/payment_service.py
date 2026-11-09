@@ -18,6 +18,7 @@ from app.services.qrisgate_service import (
     QRISGateApiError,
     QRISGateConfigurationError,
     get_qrisgate_api_key,
+    get_qrisgate_merchant_id,
     get_qrisgate_transaction,
 )
 from app.services.subscription_service import activate_pro_from_payment, utcnow
@@ -31,14 +32,12 @@ from app.services.xendit_service import (
 
 logger = logging.getLogger("raytech.payment_service")
 
-# State machine defining valid transitions
-# Terminal states: PAID cannot transition to anything else.
-# EXPIRED/FAILED/CANCELED can only transition to PAID if authoritative provider confirms settlement.
+# Only pending payments may transition. Terminal states never reopen.
 VALID_TRANSITIONS: dict[str, set[str]] = {
-    "PENDING": {"PAID", "EXPIRED", "FAILED", "CANCELED"},
-    "EXPIRED": {"PAID"},
-    "FAILED": {"PAID"},
-    "CANCELED": {"PAID"},
+    "PENDING": {"PAID", "EXPIRED", "FAILED"},
+    "EXPIRED": set(),
+    "FAILED": set(),
+    "CANCELED": set(),
     "PAID": set(),
 }
 
@@ -108,35 +107,81 @@ def reconcile_and_process_payment(
 
     # --- QRISGATE RECONCILIATION PATH ---
     if tx.provider == "qrisgate":
-        normalized_status = None
-        paid_at_time = None
+        if not get_qrisgate_api_key():
+            logger.error("QRISGate reconciliation unavailable: API key is not configured")
+            raise QRISGateConfigurationError("QRISGate API key is not configured")
 
-        # Check via authenticated QRISGate API if API key is present
-        if get_qrisgate_api_key():
-            try:
-                target_id = tx.provider_payment_id or tx.external_id
-                status_data = get_qrisgate_transaction(target_id)
-                normalized_status = status_data.get("status")
-                raw_paid_at = status_data.get("paid_at")
-                if raw_paid_at:
-                    paid_at_time = parse_iso_datetime(raw_paid_at)
-            except Exception as exc:
-                logger.warning(f"Authoritative QRISGate API check failed for tx {tx.id}: {exc}")
+        target_id = tx.provider_payment_id or tx.external_id
+        try:
+            status_data = get_qrisgate_transaction(target_id)
+        except (QRISGateApiError, QRISGateConfigurationError):
+            logger.error("Authoritative QRISGate lookup failed for tx %s", tx.id)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected QRISGate lookup failure for tx %s: %s", tx.id, type(exc).__name__)
+            raise QRISGateApiError("Authoritative QRISGate verification failed") from exc
 
-        # If not determined via API check, inspect webhook payload if provided
-        if not normalized_status and webhook_payload:
-            event_type = str(webhook_payload.get("event") or webhook_payload.get("type") or "").strip().lower()
-            if event_type == "payment.paid":
-                normalized_status = "PAID"
-                order_data = webhook_payload.get("data") if isinstance(webhook_payload.get("data"), dict) else webhook_payload
-                raw_paid_at = order_data.get("paid_at") or webhook_payload.get("paid_at")
-                if raw_paid_at:
-                    paid_at_time = parse_iso_datetime(raw_paid_at)
+        authoritative_id = str(status_data.get("id") or "").strip()
+        authoritative_external_id = str(status_data.get("external_order_id") or "").strip()
+        if not tx.provider_payment_id or authoritative_id != tx.provider_payment_id:
+            logger.error("QRISGate provider reference mismatch for tx %s", tx.id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Authoritative provider reference mismatch"},
+            )
+        if authoritative_external_id != tx.external_id:
+            logger.error("QRISGate external order mismatch for tx %s", tx.id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Authoritative external order mismatch"},
+            )
+        if expected_invoice_id and authoritative_id != expected_invoice_id:
+            logger.error("QRISGate callback provider reference mismatch for tx %s", tx.id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Callback provider reference mismatch"},
+            )
+
+        expected_merchant_id = get_qrisgate_merchant_id()
+        authoritative_merchant_id = str(status_data.get("merchant_id") or "").strip()
+        if expected_merchant_id and authoritative_merchant_id != expected_merchant_id:
+            logger.error("QRISGate merchant mismatch for tx %s", tx.id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Authoritative merchant mismatch"},
+            )
+
+        currency = str(status_data.get("currency") or tx.currency).strip().upper()
+        if currency != "IDR" or tx.currency.upper() != "IDR":
+            logger.error("QRISGate currency mismatch for tx %s", tx.id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Currency must be IDR"},
+            )
+
+        authoritative_amount = status_data.get("amount")
+        authoritative_total = status_data.get("total_amount")
+        expected_total = tx.total_amount if tx.total_amount is not None else tx.amount
+        try:
+            amount_matches = authoritative_amount is None or int(authoritative_amount) == tx.amount
+            total_matches = authoritative_total is None or int(authoritative_total) == expected_total
+        except (TypeError, ValueError):
+            amount_matches = False
+            total_matches = False
+        has_authoritative_amount = authoritative_amount is not None or authoritative_total is not None
+        if not has_authoritative_amount or not amount_matches or not total_matches:
+            logger.error("QRISGate amount mismatch for tx %s", tx.id)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "Authoritative payment amount mismatch"},
+            )
+
+        normalized_status = status_data.get("status")
+        paid_at_time = parse_iso_datetime(status_data.get("paid_at"))
 
         if normalized_status == "PAID":
-            allowed = VALID_TRANSITIONS.get(tx.status, set())
-            if "PAID" not in allowed:
-                logger.warning(f"Disallowed state transition from {tx.status} to PAID for tx {tx.id}")
+            if "PAID" not in VALID_TRANSITIONS.get(tx.status, set()):
+                logger.warning("Rejected QRISGate terminal-state transition for tx %s from %s", tx.id, tx.status)
                 return "invalid_transition", tx
 
             now = utcnow()
@@ -152,6 +197,7 @@ def reconcile_and_process_payment(
                 commit=False,
                 provider="qrisgate",
             )
+            tx.subscription_id = sub.id
 
             user = db.get(User, tx.user_id)
             if user:
@@ -165,10 +211,10 @@ def reconcile_and_process_payment(
 
             db.commit()
             db.refresh(tx)
-            logger.info(f"QRISGate payment settlement successful: user {tx.user_id} Pro activated via tx {tx.id}")
+            logger.info("QRISGate payment settlement successful for user %s via tx %s", tx.user_id, tx.id)
             return "activated", tx
 
-        elif normalized_status in ("FAILED", "EXPIRED"):
+        if normalized_status in ("FAILED", "EXPIRED"):
             if tx.status == "PENDING":
                 tx.status = normalized_status
                 tx.updated_at = utcnow()
@@ -176,11 +222,10 @@ def reconcile_and_process_payment(
                 db.refresh(tx)
             return "failed" if normalized_status == "FAILED" else "expired", tx
 
-        else:
-            tx.updated_at = utcnow()
-            db.commit()
-            db.refresh(tx)
-            return "pending", tx
+        tx.updated_at = utcnow()
+        db.commit()
+        db.refresh(tx)
+        return "pending", tx
 
     # --- DUITKU RECONCILIATION PATH ---
     if tx.provider == "duitku":

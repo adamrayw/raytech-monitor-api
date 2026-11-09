@@ -117,6 +117,7 @@ def me(
         "email": user.email,
         "name": user.name,
         "picture": user.picture,
+        "is_admin": user.is_admin,
     }
 
 @router.post("/logout")

@@ -23,6 +23,36 @@ def request_shutdown():
     shutdown_event.set()
 
 
+def record_worker_heartbeat(status: str, details: str | None = None) -> None:
+    from app.database import SessionLocal
+    from app.models.service_health import ServiceHealth
+
+    db = SessionLocal()
+    try:
+        heartbeat = db.get(ServiceHealth, "monitor-worker")
+        if heartbeat is None:
+            heartbeat = ServiceHealth(service="monitor-worker")
+        heartbeat.status = status
+        heartbeat.details = details
+        heartbeat.last_seen_at = datetime.now(timezone.utc)
+        db.add(heartbeat)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(
+            json.dumps(
+                {
+                    "event": "worker_heartbeat_error",
+                    "timestamp": utcnow_iso(),
+                    "error": type(exc).__name__,
+                }
+            ),
+            flush=True,
+        )
+    finally:
+        db.close()
+
+
 async def worker_loop():
     loop = asyncio.get_running_loop()
 
@@ -50,6 +80,8 @@ async def worker_loop():
     last_lifecycle_check: float = 0.0
 
     while not shutdown_event.is_set():
+        cycle_status = "healthy"
+        cycle_error: str | None = None
         try:
             result = await run_due_monitors()
 
@@ -116,6 +148,8 @@ async def worker_loop():
                         flush=True,
                     )
             except Exception as email_exc:
+                cycle_status = "degraded"
+                cycle_error = f"email:{type(email_exc).__name__}"
                 print(
                     json.dumps(
                         {
@@ -152,6 +186,8 @@ async def worker_loop():
                             flush=True,
                         )
                 except Exception as life_exc:
+                    cycle_status = "degraded"
+                    cycle_error = f"subscription:{type(life_exc).__name__}"
                     print(
                         json.dumps(
                             {
@@ -165,6 +201,8 @@ async def worker_loop():
                     )
 
         except Exception as exc:
+            cycle_status = "degraded"
+            cycle_error = type(exc).__name__
             print(
                 json.dumps(
                     {
@@ -177,13 +215,25 @@ async def worker_loop():
                 flush=True,
             )
 
-        # Record liveness heartbeat for container progress probes
+        # Record loop health for the admin API and host/container probes.
+        await asyncio.to_thread(record_worker_heartbeat, cycle_status, cycle_error)
         try:
             heartbeat_path = os.environ.get("WORKER_HEARTBEAT_FILE", "/tmp/raytech_worker_heartbeat")
-            with open(heartbeat_path, "w") as hf:
+            temp_path = f"{heartbeat_path}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as hf:
                 hf.write(utcnow_iso())
-        except Exception:
-            pass
+            os.replace(temp_path, heartbeat_path)
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "event": "worker_heartbeat_file_error",
+                        "timestamp": utcnow_iso(),
+                        "error": type(exc).__name__,
+                    }
+                ),
+                flush=True,
+            )
 
         try:
             await asyncio.wait_for(

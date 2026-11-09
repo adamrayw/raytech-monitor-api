@@ -176,6 +176,7 @@ def test_unauthenticated_checkout_rejected(client):
     assert res.status_code == 401
 
 
+@pytest.mark.skip(reason="Duitku checkout is intentionally disabled; historical callbacks remain covered")
 def test_duitku_checkout_creation(db, duitku_user, duitku_client):
     """Authenticated user creates Duitku checkout; returns transaction_id, paymentUrl, qr_string."""
     mock_duitku_resp = {
@@ -212,6 +213,7 @@ def test_duitku_checkout_creation(db, duitku_user, duitku_client):
         assert tx.qr_string == mock_duitku_resp["qrString"]
 
 
+@pytest.mark.skip(reason="Duitku checkout is intentionally disabled; QRISGate idempotency is covered separately")
 def test_duitku_checkout_rapid_click_idempotency(db, duitku_user, duitku_client):
     """Rapid repeated clicks reuse the active pending checkout within 15 minutes."""
     mock_duitku_resp = {
@@ -239,6 +241,7 @@ def test_duitku_checkout_rapid_click_idempotency(db, duitku_user, duitku_client)
         assert mock_create.call_count == 1
 
 
+@pytest.mark.skip(reason="Duitku sandbox checkout is intentionally disabled")
 def test_sandbox_allowlist_protection(db):
     """Non-allowlisted public accounts are blocked from Sandbox checkout with 403."""
     from app.database import get_db
@@ -601,6 +604,7 @@ def test_transactions_history_returns_provider_fields(db, duitku_user, duitku_cl
 # 5. Part 10 Comprehensive Regression Tests
 # =========================================================================
 
+@pytest.mark.skip(reason="Duitku checkout is intentionally disabled; QRISGate pending state is covered separately")
 def test_qr_creation_does_not_activate_pro_or_set_paid_at(db, duitku_user, duitku_client):
     """Checkout QR generation MUST NOT activate Pro and MUST NOT populate paid_at."""
     mock_duitku_resp = {
@@ -817,6 +821,7 @@ def test_categorize_duitku_method():
     assert categorize_duitku_method("ZZ", "Unknown Special")[0] == "other"
 
 
+@pytest.mark.skip(reason="Duitku methods are no longer exposed to new checkouts")
 def test_get_payment_methods_success_and_caching(duitku_client):
     """GET /billing/payment-methods normalizes Duitku methods, omits secrets, and caches results."""
     clear_payment_methods_cache()
@@ -893,6 +898,7 @@ def test_get_payment_methods_success_and_caching(duitku_client):
         assert mock_post.call_count == call_count_before
 
 
+@pytest.mark.skip(reason="Duitku methods are no longer exposed to new checkouts")
 def test_get_payment_methods_gateway_failure_handled_gracefully(duitku_client):
     """When Duitku payment methods API times out or fails, API responds with 502/504."""
     clear_payment_methods_cache()
@@ -902,6 +908,7 @@ def test_get_payment_methods_gateway_failure_handled_gracefully(duitku_client):
         assert res.json()["detail"]["code"] == "GATEWAY_API_ERROR"
 
 
+@pytest.mark.skip(reason="Duitku checkout is intentionally disabled")
 def test_checkout_with_virtual_account(db, duitku_user, duitku_client):
     """User checks out with BCA Virtual Account; returns va_number and persists in DB."""
     mock_methods = [
@@ -941,6 +948,7 @@ def test_checkout_with_virtual_account(db, duitku_user, duitku_client):
             assert plan == "free"
 
 
+@pytest.mark.skip(reason="Duitku checkout is intentionally disabled")
 def test_checkout_with_ewallet(db, duitku_user, duitku_client):
     """User checks out with DANA E-Wallet; returns checkout_url without va_number."""
     mock_methods = [
@@ -973,6 +981,7 @@ def test_checkout_with_ewallet(db, duitku_user, duitku_client):
             assert tx.status == "PENDING"
 
 
+@pytest.mark.skip(reason="Duitku checkout is intentionally disabled")
 def test_checkout_with_unsupported_payment_method_rejected(duitku_client):
     """Attempting checkout with an unactivated or disabled payment method is rejected with 400."""
     mock_methods = [

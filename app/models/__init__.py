@@ -13,6 +13,7 @@ from app.models.subscription import UserSubscription
 from app.models.subscription_audit import SubscriptionAuditLog
 from app.models.payment_transaction import PaymentTransaction
 from app.models.webhook_event import ProcessedWebhookEvent
+from app.models.service_health import ServiceHealth
 
 __all__ = [
     "User",
@@ -31,5 +32,6 @@ __all__ = [
     "SubscriptionAuditLog",
     "PaymentTransaction",
     "ProcessedWebhookEvent",
+    "ServiceHealth",
 ]
 

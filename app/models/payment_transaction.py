@@ -39,6 +39,13 @@ class PaymentTransaction(Base):
         nullable=False,
     )
 
+    revenue_classification: Mapped[str] = mapped_column(
+        String(32),
+        default="UNKNOWN",
+        index=True,
+        nullable=False,
+    )
+
     provider_payment_id: Mapped[str | None] = mapped_column(
         String(128),
         index=True,

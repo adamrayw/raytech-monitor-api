@@ -672,6 +672,7 @@ def test_reactivation_restores_all_resources_safely(pg_db, seeded_users):
             amount=49000,
             currency="IDR",
             status="PENDING",
+            provider="xendit",
             payment_method="BANK_TRANSFER",
             created_at=reactivate_time,
         )

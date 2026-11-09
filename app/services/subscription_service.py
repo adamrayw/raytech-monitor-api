@@ -167,48 +167,16 @@ def get_or_create_subscription(db: Session, user_id: int, commit: bool = True) -
 def get_effective_plan(db: Session, user_id: int) -> tuple[str, UserSubscription]:
     """Returns effective plan id ('free' or 'pro') and subscription record.
 
-    Never interprets missing or error state as Pro.
-    Automatically checks and enforces expiration on paid Pro subscriptions even if worker is delayed.
+    Never interprets missing, expired, or error state as Pro. Expiration persistence is
+    handled by the locked worker lifecycle job so entitlement reads remain side-effect-free.
     """
     try:
         sub = get_or_create_subscription(db, user_id)
-
-        # Evaluate automatic expiration for paid Pro (without grandfathered legacy_override)
-        if sub.plan == "pro" and not getattr(sub, "legacy_override", False):
-            if sub.current_period_end is not None:
-                now = utcnow()
-                end_time = sub.current_period_end if sub.current_period_end.tzinfo else sub.current_period_end.replace(tzinfo=timezone.utc)
-                if now > end_time:
-                    logger.info(f"User {user_id} Pro subscription expired at {sub.current_period_end}. Downgrading to Free.")
-                    previous_plan = sub.plan
-                    sub.plan = "free"
-                    sub.status = "expired"
-                    sub.updated_at = now
-
-                    record_subscription_audit_event(
-                        db=db,
-                        user_id=user_id,
-                        subscription_id=sub.id,
-                        previous_plan=previous_plan,
-                        new_plan="free",
-                        event_type="pro_expired",
-                        reason="period_ended",
-                        commit=False,
-                    )
-
-                    user = db.get(User, user_id)
-                    if user:
-                        from app.services.email_service import enqueue_subscription_expired_email
-                        enqueue_subscription_expired_email(db, user, sub)
-
-                    try:
-                        db.commit()
-                        db.refresh(sub)
-                    except Exception as e:
-                        db.rollback()
-                        logger.warning(f"Failed to persist expired status for user {user_id}: {e}")
-
         plan_id = sub.plan.lower() if sub.plan else "free"
+        if plan_id == "pro" and not getattr(sub, "legacy_override", False):
+            end_time = ensure_utc(sub.current_period_end)
+            if end_time is None or end_time <= utcnow():
+                return "free", sub
         if plan_id not in PLAN_CONFIG:
             plan_id = "free"
         return plan_id, sub

@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.database import Base, engine
+from app.database import engine
 from app import models
 from app.routes.monitors import router as monitors_router
 from app.routes.incidents import router as incidents_router
@@ -26,6 +26,7 @@ from app.routes.public_status import router as public_status_router
 from app.routes.subscription import router as subscription_router
 from app.routes.billing import router as billing_router
 from app.routes.webhooks import router as webhooks_router
+from app.routes.admin import router as admin_router
 
 logger = logging.getLogger("raytech.api")
 
@@ -49,11 +50,11 @@ app.add_middleware(
 )
 
 # Production environment isolates CORS exclusively to FRONTEND_URL
-env = os.environ.get("ENVIRONMENT", "").strip().lower()
-if env in ("production", "prod"):
-    allowed_origins = [frontend_url]
-else:
+env = os.environ.get("ENVIRONMENT", "production").strip().lower()
+if env in ("development", "dev", "test"):
     allowed_origins = list({frontend_url, "http://localhost:3000", "http://127.0.0.1:3000"})
+else:
+    allowed_origins = [frontend_url]
 
 app.add_middleware(
     CORSMiddleware,
@@ -185,121 +186,9 @@ app.add_middleware(SecurityHeadersAndBodyLimitMiddleware)
 
 @app.on_event("startup")
 def startup():
-    Base.metadata.create_all(bind=engine)
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_monitoring_enabled BOOLEAN NOT NULL DEFAULT FALSE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_warning_days INTEGER NOT NULL DEFAULT 14;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_status VARCHAR(32) NOT NULL DEFAULT 'unknown';"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_next_check_at TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_last_checked_at TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_last_successful_check_at TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_expires_at TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_issuer VARCHAR(255);"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_subject VARCHAR(255);"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_serial_number VARCHAR(128);"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_fingerprint_sha256 VARCHAR(64);"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_valid_from TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_error_type VARCHAR(64);"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS ssl_error_message TEXT;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS expected_interval_seconds INTEGER;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS grace_period_seconds INTEGER;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS next_expected_at TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMP WITH TIME ZONE;"))
-            conn.execute(text("ALTER TABLE monitors ADD COLUMN IF NOT EXISTS heartbeat_token_hash VARCHAR(64);"))
-            conn.execute(text("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution_reason VARCHAR(64);"))
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS user_subscriptions (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    plan VARCHAR(32) NOT NULL DEFAULT 'free',
-                    status VARCHAR(32) NOT NULL DEFAULT 'active',
-                    started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    current_period_start TIMESTAMP WITH TIME ZONE,
-                    current_period_end TIMESTAMP WITH TIME ZONE,
-                    cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE,
-                    legacy_override BOOLEAN NOT NULL DEFAULT FALSE,
-                    override_reason VARCHAR(128),
-                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-            """))
-            conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS legacy_override BOOLEAN NOT NULL DEFAULT FALSE;"))
-            conn.execute(text("ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS override_reason VARCHAR(128);"))
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS payment_transactions (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    subscription_id INTEGER REFERENCES user_subscriptions(id) ON DELETE SET NULL,
-                    provider VARCHAR(32) NOT NULL DEFAULT 'qrisgate',
-                    provider_payment_id VARCHAR(128),
-                    provider_session_id VARCHAR(128),
-                    external_id VARCHAR(128) UNIQUE NOT NULL,
-                    plan VARCHAR(32) NOT NULL DEFAULT 'pro',
-                    amount INTEGER NOT NULL DEFAULT 49000,
-                    currency VARCHAR(8) NOT NULL DEFAULT 'IDR',
-                    status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
-                    payment_method VARCHAR(64),
-                    payment_channel VARCHAR(64),
-                    checkout_url VARCHAR(512),
-                    expires_at TIMESTAMP WITH TIME ZONE,
-                    paid_at TIMESTAMP WITH TIME ZONE,
-                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-            """))
-            try:
-                conn.execute(text("ALTER TABLE monitors ALTER COLUMN url DROP NOT NULL;"))
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE email_deliveries ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128) UNIQUE;"))
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS va_number VARCHAR(64);"))
-                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS qr_string TEXT;"))
-                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS provider_mode VARCHAR(32) NOT NULL DEFAULT 'live';"))
-                conn.execute(text("ALTER TABLE payment_transactions ALTER COLUMN provider SET DEFAULT 'qrisgate';"))
-                conn.execute(text("ALTER TABLE payment_transactions ALTER COLUMN provider_mode SET DEFAULT 'live';"))
-                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS unique_code INTEGER;"))
-                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS total_amount INTEGER;"))
-                conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS processed_webhook_events (
-                        event_id VARCHAR(128) PRIMARY KEY,
-                        provider VARCHAR(32) NOT NULL,
-                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    );
-                """))
-            except Exception:
-                pass
-            try:
-                conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS subscription_audit_logs (
-                        id SERIAL PRIMARY KEY,
-                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                        subscription_id INTEGER NOT NULL REFERENCES user_subscriptions(id) ON DELETE CASCADE,
-                        previous_plan VARCHAR(32) NOT NULL,
-                        new_plan VARCHAR(32) NOT NULL,
-                        event_type VARCHAR(64) NOT NULL,
-                        reason VARCHAR(255),
-                        payment_transaction_id INTEGER REFERENCES payment_transactions(id) ON DELETE SET NULL,
-                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    );
-                """))
-            except Exception:
-                pass
-            conn.commit()
-    except Exception:
-        pass
+    from app.services.qrisgate_service import validate_qrisgate_environment
 
-
-    try:
-        from app.services.qrisgate_service import validate_qrisgate_environment
-        validate_qrisgate_environment()
-    except Exception as exc:
-        logger.warning(f"QRISGate environment check: {exc}")
+    validate_qrisgate_environment()
 
 
 app.include_router(monitors_router)
@@ -314,6 +203,7 @@ app.include_router(subscription_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
 app.include_router(webhooks_router, prefix="/api")
+app.include_router(admin_router)
 
 # Explicit aliases required by QRISGate integration specs:
 from app.routes.billing import CheckoutRequest, create_checkout_session, get_order_by_id
@@ -336,9 +226,14 @@ def api_checkout_alias(
 def api_v1_transaction_status(
     transaction_id_or_external_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Alias for transaction order status and polling fulfilling Task 3 specification."""
-    return get_order_by_id(order_id=transaction_id_or_external_id, db=db)
+    """Authenticated alias for transaction order status and polling."""
+    return get_order_by_id(
+        order_id=transaction_id_or_external_id,
+        db=db,
+        current_user=current_user,
+    )
 
 @app.get("/")
 def root():

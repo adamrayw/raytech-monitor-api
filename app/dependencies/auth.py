@@ -29,7 +29,8 @@ def get_current_user(
         if user is not None and user.is_active:
             return user
 
-    is_production = os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod")
+    environment = os.environ.get("ENVIRONMENT", "production").strip().lower()
+    is_production = environment not in ("development", "dev", "test")
     if (
         not is_production
         and DEV_TOKEN
@@ -54,3 +55,12 @@ def get_current_user(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Authentication required",
     )
+
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required",
+        )
+    return current_user
