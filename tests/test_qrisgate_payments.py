@@ -30,15 +30,28 @@ from app.services.qrisgate_service import (
     get_qrisgate_api_key,
     get_qrisgate_base_url,
     get_qrisgate_payment_methods,
+    get_qrisgate_transaction,
     get_qrisgate_webhook_secret,
     verify_qrisgate_timestamp,
     verify_qrisgate_webhook_signature,
 )
-from app.services.payment_service import reconcile_and_process_payment
+from app.services.payment_service import (
+    qrisgate_external_order_matches,
+    reconcile_and_process_payment,
+)
 from app.services.subscription_service import get_effective_plan, utcnow
 
 TEST_API_KEY = "qg_live_test_api_key_secret_abcdef123456"
 TEST_WEBHOOK_SECRET = "whsec_test_webhook_secret_7890xyz"
+
+
+def qrisgate_signature(
+    raw_body: bytes,
+    timestamp: str,
+    secret: str = TEST_WEBHOOK_SECRET,
+) -> str:
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
+    return hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
 
 os.environ["QRISGATE_BASE_URL"] = "https://qrisgate.web.id"
 os.environ["QRISGATE_API_KEY"] = TEST_API_KEY
@@ -93,17 +106,15 @@ def qrisgate_client(db, qrisgate_user):
 # =========================================================================
 
 def test_signature_verification_success():
-    """Valid HMAC-SHA256 signature in hex matches expected signature."""
+    """Valid QRISGate timestamp-and-body signature is accepted."""
     raw_body = b'{"event":"payment.paid","external_order_id":"qrg_123"}'
-    expected_sig = hmac.new(
-        TEST_WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
+    timestamp = str(int(time.time()))
+    expected_sig = qrisgate_signature(raw_body, timestamp)
 
     assert verify_qrisgate_webhook_signature(
         raw_body=raw_body,
         signature_header=expected_sig,
+        timestamp_header=timestamp,
         secret=TEST_WEBHOOK_SECRET,
     ) is True
 
@@ -111,16 +122,14 @@ def test_signature_verification_success():
 def test_signature_verification_failure_on_tampered_body():
     """Altered body produces signature mismatch and fails verification."""
     raw_body = b'{"event":"payment.paid","amount":49000}'
-    expected_sig = hmac.new(
-        TEST_WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
+    timestamp = str(int(time.time()))
+    expected_sig = qrisgate_signature(raw_body, timestamp)
 
     tampered_body = b'{"event":"payment.paid","amount":1000}'
     assert verify_qrisgate_webhook_signature(
         raw_body=tampered_body,
         signature_header=expected_sig,
+        timestamp_header=timestamp,
         secret=TEST_WEBHOOK_SECRET,
     ) is False
 
@@ -128,24 +137,25 @@ def test_signature_verification_failure_on_tampered_body():
 def test_signature_verification_failure_on_wrong_secret():
     """Verification fails when secret key does not match."""
     raw_body = b'{"event":"payment.paid"}'
-    fake_sig = hmac.new(
-        b"wrong_secret",
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
+    timestamp = str(int(time.time()))
+    fake_sig = qrisgate_signature(raw_body, timestamp, secret="wrong_secret")
 
     assert verify_qrisgate_webhook_signature(
         raw_body=raw_body,
         signature_header=fake_sig,
+        timestamp_header=timestamp,
         secret=TEST_WEBHOOK_SECRET,
     ) is False
 
 
 def test_signature_verification_missing_or_empty():
-    """Empty signature header fails closed."""
+    """Missing signature or timestamp fails closed."""
     raw_body = b'{"event":"payment.paid"}'
-    assert verify_qrisgate_webhook_signature(raw_body, "", TEST_WEBHOOK_SECRET) is False
-    assert verify_qrisgate_webhook_signature(raw_body, None, TEST_WEBHOOK_SECRET) is False
+    timestamp = str(int(time.time()))
+    signature = qrisgate_signature(raw_body, timestamp)
+    assert verify_qrisgate_webhook_signature(raw_body, "", timestamp, TEST_WEBHOOK_SECRET) is False
+    assert verify_qrisgate_webhook_signature(raw_body, None, timestamp, TEST_WEBHOOK_SECRET) is False
+    assert verify_qrisgate_webhook_signature(raw_body, signature, None, TEST_WEBHOOK_SECRET) is False
 
 
 def test_timestamp_anti_replay_within_window():
@@ -211,8 +221,8 @@ def test_webhook_rejects_invalid_signature(qrisgate_client):
 def test_webhook_rejects_expired_timestamp(qrisgate_client):
     """Webhook rejects request with HTTP 401 when timestamp > 5 minutes old."""
     body = b'{"event":"payment.paid"}'
-    sig = hmac.new(TEST_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    six_minutes_ago = int(time.time()) - 360
+    six_minutes_ago = str(int(time.time()) - 360)
+    sig = qrisgate_signature(body, six_minutes_ago)
 
     resp = qrisgate_client.post(
         "/api/webhooks/qrisgate",
@@ -220,7 +230,7 @@ def test_webhook_rejects_expired_timestamp(qrisgate_client):
         headers={
             "content-type": "application/json",
             "x-qrisgate-signature": sig,
-            "x-qrisgate-timestamp": str(six_minutes_ago),
+            "x-qrisgate-timestamp": six_minutes_ago,
         },
     )
     assert resp.status_code == 401
@@ -251,20 +261,17 @@ def test_webhook_payment_paid_fulfillment(db, qrisgate_client, qrisgate_user):
     db.refresh(tx)
 
     payload = {
-        "event_id": "evt_qrg_1001",
         "event": "payment.paid",
-        "data": {
-            "external_order_id": external_order_id,
-            "id": "tx_qrg_999",
-            "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
-            "total_amount": PRO_SUBSCRIPTION_AMOUNT_IDR + 5,
-            "unique_code": 5,
-            "paid_at": datetime.now(timezone.utc).isoformat(),
-        },
+        "transaction_id": "tx_qrg_999",
+        "external_order_id": external_order_id,
+        "base_amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "total_amount": PRO_SUBSCRIPTION_AMOUNT_IDR + 5,
+        "unique_code": 5,
+        "paid_at": datetime.now(timezone.utc).isoformat(),
     }
     raw_body = json.dumps(payload).encode("utf-8")
-    sig = hmac.new(TEST_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     ts = str(int(time.time()))
+    sig = qrisgate_signature(raw_body, ts)
 
     authoritative = {
         "id": "tx_qrg_999",
@@ -272,7 +279,7 @@ def test_webhook_payment_paid_fulfillment(db, qrisgate_client, qrisgate_user):
         "status": "PAID",
         "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
         "currency": "IDR",
-        "paid_at": payload["data"]["paid_at"],
+        "paid_at": payload["paid_at"],
     }
     with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):
         resp = qrisgate_client.post(
@@ -282,6 +289,7 @@ def test_webhook_payment_paid_fulfillment(db, qrisgate_client, qrisgate_user):
                 "content-type": "application/json",
                 "x-qrisgate-signature": sig,
                 "x-qrisgate-timestamp": ts,
+                "x-qrisgate-delivery-id": "delivery_qrg_1001",
             },
         )
 
@@ -309,7 +317,7 @@ def test_webhook_payment_paid_fulfillment(db, qrisgate_client, qrisgate_user):
 
 
 def test_webhook_idempotency_duplicate_event(db, qrisgate_client, qrisgate_user):
-    """Sending the same event_id repeatedly returns 200 without executing fulfillment twice."""
+    """Repeating a delivery ID returns 200 without executing fulfillment twice."""
     external_order_id = "qrg_test_order_idempotent_001"
     tx = PaymentTransaction(
         user_id=qrisgate_user.id,
@@ -325,22 +333,21 @@ def test_webhook_idempotency_duplicate_event(db, qrisgate_client, qrisgate_user)
     db.commit()
 
     payload = {
-        "event_id": "evt_repeat_idempotency_777",
         "event": "payment.paid",
-        "data": {
-            "external_order_id": external_order_id,
-            "id": "tx_qrg_888",
-            "paid_at": datetime.now(timezone.utc).isoformat(),
-        },
+        "transaction_id": "tx_qrg_888",
+        "external_order_id": external_order_id,
+        "base_amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "paid_at": datetime.now(timezone.utc).isoformat(),
     }
     raw_body = json.dumps(payload).encode("utf-8")
-    sig = hmac.new(TEST_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     ts = str(int(time.time()))
+    sig = qrisgate_signature(raw_body, ts)
 
     headers = {
         "content-type": "application/json",
         "x-qrisgate-signature": sig,
         "x-qrisgate-timestamp": ts,
+        "x-qrisgate-delivery-id": "delivery_repeat_idempotency_777",
     }
 
     authoritative = {
@@ -349,7 +356,7 @@ def test_webhook_idempotency_duplicate_event(db, qrisgate_client, qrisgate_user)
         "status": "PAID",
         "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
         "currency": "IDR",
-        "paid_at": payload["data"]["paid_at"],
+        "paid_at": payload["paid_at"],
     }
     with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):
         # First attempt: succeeds and fulfills
@@ -507,6 +514,83 @@ def test_order_polling_reconciliation(db, qrisgate_client, qrisgate_user):
     assert tx.paid_at is not None
 
 
+def test_qrisgate_status_maps_production_response_fields():
+    provider_response = {
+        "success": True,
+        "data": {
+            "transaction_id": "trx_0f19a5cbf456e57c1275b375",
+            "external_order_id": "••••449b",
+            "status": "PAID",
+            "base_amount": 49000,
+            "unique_code": 9,
+            "total_amount": 49009,
+            "paid_at": "2026-11-09T14:32:10.054Z",
+        },
+    }
+
+    with patch(
+        "app.services.qrisgate_service._execute_qrisgate_request_with_retry",
+        return_value=provider_response,
+    ):
+        result = get_qrisgate_transaction("trx_0f19a5cbf456e57c1275b375")
+
+    assert result["id"] == "trx_0f19a5cbf456e57c1275b375"
+    assert result["external_order_id"] == "••••449b"
+    assert result["status"] == "PAID"
+    assert result["amount"] == 49000
+    assert result["total_amount"] == 49009
+
+
+def test_masked_external_order_reconciliation_activates_once(db, qrisgate_user):
+    tx = PaymentTransaction(
+        user_id=qrisgate_user.id,
+        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        total_amount=49009,
+        currency="IDR",
+        status="PENDING",
+        provider="qrisgate",
+        external_id="qrg_1_1794234675_1bd3449b",
+        provider_payment_id="trx_0f19a5cbf456e57c1275b375",
+    )
+    db.add(tx)
+    db.commit()
+
+    authoritative = {
+        "id": tx.provider_payment_id,
+        "external_order_id": "••••449b",
+        "status": "PAID",
+        "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
+        "total_amount": 49009,
+        "paid_at": "2026-11-09T14:32:10.054Z",
+    }
+
+    with patch(
+        "app.services.payment_service.get_qrisgate_transaction",
+        return_value=authoritative,
+    ):
+        outcome, _ = reconcile_and_process_payment(db, tx.id)
+        duplicate_outcome, _ = reconcile_and_process_payment(db, tx.id)
+
+    assert outcome == "activated"
+    assert duplicate_outcome == "already_paid"
+    db.refresh(tx)
+    assert tx.status == "PAID"
+    assert get_effective_plan(db, qrisgate_user.id)[0] == "pro"
+
+
+@pytest.mark.parametrize(
+    ("authoritative", "expected"),
+    [
+        ("••••0000", "qrg_1_1794234675_1bd3449b"),
+        ("masked449b", "qrg_1_1794234675_1bd3449b"),
+        ("•••449b", "qrg_1_1794234675_1bd3449b"),
+        ("", "qrg_1_1794234675_1bd3449b"),
+    ],
+)
+def test_masked_external_order_rejects_invalid_values(authoritative, expected):
+    assert qrisgate_external_order_matches(authoritative, expected) is False
+
+
 def test_authoritative_amount_mismatch_is_rejected(db, qrisgate_user):
     tx = PaymentTransaction(
         user_id=qrisgate_user.id,
@@ -586,7 +670,8 @@ def test_provider_lookup_failure_does_not_trust_paid_webhook(db, qrisgate_client
         "data": {"id": tx.provider_payment_id, "external_order_id": tx.external_id},
     }
     raw_body = json.dumps(payload).encode("utf-8")
-    signature = hmac.new(TEST_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    timestamp = str(int(time.time()))
+    signature = qrisgate_signature(raw_body, timestamp)
 
     with patch(
         "app.services.payment_service.get_qrisgate_transaction",
@@ -598,7 +683,8 @@ def test_provider_lookup_failure_does_not_trust_paid_webhook(db, qrisgate_client
             headers={
                 "content-type": "application/json",
                 "x-qrisgate-signature": signature,
-                "x-qrisgate-timestamp": str(int(time.time())),
+                "x-qrisgate-timestamp": timestamp,
+                "x-qrisgate-delivery-id": "delivery_qrg_fail_closed",
             },
         )
 

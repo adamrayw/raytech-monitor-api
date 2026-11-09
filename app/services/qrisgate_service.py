@@ -106,14 +106,11 @@ def get_frontend_url() -> str:
 def verify_qrisgate_webhook_signature(
     raw_body: bytes,
     signature_header: str | None,
+    timestamp_header: str | None,
     secret: str | None = None,
 ) -> bool:
-    """Verifies HMAC-SHA256 signature in hex from x-qrisgate-signature header.
-
-    Formula: HMAC-SHA256(rawBody, QRISGATE_WEBHOOK_SECRET)
-    Comparison is performed using timing-safe hmac.compare_digest.
-    """
-    if not signature_header:
+    """Verify QRISGate's HMAC-SHA256 signature over timestamp + raw body."""
+    if not signature_header or not timestamp_header:
         return False
 
     webhook_secret = secret or get_qrisgate_webhook_secret()
@@ -121,9 +118,10 @@ def verify_qrisgate_webhook_signature(
         logger.error("QRISGATE_WEBHOOK_SECRET is not configured; cannot verify signature")
         return False
 
+    signed_payload = timestamp_header.strip().encode("utf-8") + b"." + raw_body
     expected_signature = hmac.new(
         webhook_secret.encode("utf-8"),
-        raw_body,
+        signed_payload,
         hashlib.sha256,
     ).hexdigest()
 
@@ -402,12 +400,16 @@ def get_qrisgate_transaction(transaction_id_or_external_id: str | int) -> dict[s
     elif raw_status in ("FAILED", "CANCELED", "CANCELLED", "REJECTED"):
         normalized_status = "FAILED"
 
+    base_amount = inner.get("base_amount")
+    if base_amount is None:
+        base_amount = inner.get("amount")
+
     return {
-        "id": str(inner.get("id") or clean_id),
+        "id": str(inner.get("transaction_id") or inner.get("id") or ""),
         "external_order_id": inner.get("external_order_id"),
         "status": normalized_status,
         "raw_status": raw_status,
-        "amount": inner.get("amount"),
+        "amount": base_amount,
         "total_amount": inner.get("total_amount"),
         "currency": inner.get("currency"),
         "merchant_id": inner.get("merchant_id") or inner.get("merchant_code"),

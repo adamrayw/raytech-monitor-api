@@ -250,6 +250,7 @@ async def qrisgate_webhook(
     db: Session = Depends(get_db),
     x_qrisgate_signature: str | None = Header(None, alias="x-qrisgate-signature"),
     x_qrisgate_timestamp: str | None = Header(None, alias="x-qrisgate-timestamp"),
+    x_qrisgate_delivery_id: str | None = Header(None, alias="x-qrisgate-delivery-id"),
 ) -> Response:
     """Public webhook receiver endpoint for QRISGate payment callbacks.
 
@@ -264,20 +265,24 @@ async def qrisgate_webhook(
     # 1. Read RAW body
     raw_body = await request.body()
 
-    # 2. Timing-safe HMAC-SHA256 signature verification
-    if not x_qrisgate_signature or not verify_qrisgate_webhook_signature(raw_body, x_qrisgate_signature):
-        logger.warning("Rejected QRISGate webhook: Invalid or missing x-qrisgate-signature")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "Invalid or missing signature"},
-        )
-
-    # 3. Anti-replay verification (reject if timestamp > 5 minutes from now)
+    # 2. Reject stale requests before authenticating timestamp + raw body.
     if not x_qrisgate_timestamp or not verify_qrisgate_timestamp(x_qrisgate_timestamp, max_age_seconds=300):
-        logger.warning(f"Rejected QRISGate webhook: Timestamp expired or missing ({x_qrisgate_timestamp})")
+        logger.warning("Rejected QRISGate webhook: timestamp expired, missing, or invalid")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": "Timestamp outside acceptable 5-minute window or invalid"},
+        )
+
+    # 3. QRISGate signs the exact timestamp header, a dot, and the raw body.
+    if not x_qrisgate_signature or not verify_qrisgate_webhook_signature(
+        raw_body,
+        x_qrisgate_signature,
+        x_qrisgate_timestamp,
+    ):
+        logger.warning("Rejected QRISGate webhook: invalid or missing signature")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Invalid or missing signature"},
         )
 
     # 4. Parse JSON
@@ -290,7 +295,12 @@ async def qrisgate_webhook(
             detail={"error": "Invalid JSON body"},
         )
 
-    event_id = str(payload.get("event_id") or payload.get("id") or "").strip()
+    event_id = str(x_qrisgate_delivery_id or payload.get("event_id") or "").strip()
+    if len(event_id) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "Invalid delivery ID"},
+        )
     event_type = str(payload.get("event") or payload.get("type") or "").strip().lower()
     order_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
 

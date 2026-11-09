@@ -1,3 +1,4 @@
+import hmac
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -50,6 +51,23 @@ def parse_iso_datetime(dt_str: Any) -> datetime | None:
         return datetime.fromisoformat(clean)
     except Exception:
         return None
+
+
+def qrisgate_external_order_matches(authoritative: str, expected: str) -> bool:
+    if authoritative == expected:
+        return True
+
+    suffix_length = 4
+    if len(authoritative) <= suffix_length or len(expected) < suffix_length:
+        return False
+
+    masked_prefix = authoritative[:-suffix_length]
+    suffix = authoritative[-suffix_length:]
+    return (
+        len(masked_prefix) >= suffix_length
+        and set(masked_prefix) == {"•"}
+        and hmac.compare_digest(suffix, expected[-suffix_length:])
+    )
 
 
 def reconcile_and_process_payment(
@@ -129,7 +147,7 @@ def reconcile_and_process_payment(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={"error": "Authoritative provider reference mismatch"},
             )
-        if authoritative_external_id != tx.external_id:
+        if not qrisgate_external_order_matches(authoritative_external_id, tx.external_id):
             logger.error("QRISGate external order mismatch for tx %s", tx.id)
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
