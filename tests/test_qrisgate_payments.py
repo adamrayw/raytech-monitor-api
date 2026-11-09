@@ -121,7 +121,7 @@ def test_signature_verification_success():
 
 def test_signature_verification_failure_on_tampered_body():
     """Altered body produces signature mismatch and fails verification."""
-    raw_body = b'{"event":"payment.paid","amount":49000}'
+    raw_body = b'{"event":"payment.paid","amount":29000}'
     timestamp = str(int(time.time()))
     expected_sig = qrisgate_signature(raw_body, timestamp)
 
@@ -387,13 +387,16 @@ def test_checkout_endpoint_success(db, qrisgate_client, qrisgate_user):
         "id": "qrg_tx_12345",
         "external_order_id": "qrg_buyer_001",
         "checkout_url": "https://qrisgate.web.id/pay/qrg_tx_12345",
-        "total_amount": 49005,
+        "total_amount": 29005,
         "unique_code": 5,
         "qr_string": "00020101021226...test_qr",
         "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
     }
 
-    with patch("app.routes.billing.create_qrisgate_transaction", return_value=mock_qrg_response):
+    with patch(
+        "app.routes.billing.create_qrisgate_transaction",
+        return_value=mock_qrg_response,
+    ) as mock_create:
         resp = qrisgate_client.post(
             "/api/checkout",
             json={"plan": "pro", "provider": "qrisgate", "payment_method": "QRIS"},
@@ -406,7 +409,7 @@ def test_checkout_endpoint_success(db, qrisgate_client, qrisgate_user):
     assert "data" in body
     data = body["data"]
     assert data["checkout_url"] == "https://qrisgate.web.id/pay/qrg_tx_12345"
-    assert data["total_amount"] == 49005
+    assert data["total_amount"] == 29005
     assert data["unique_code"] == 5
     assert data["qr_string"] == "00020101021226...test_qr"
     assert data["expires_at"] is not None
@@ -418,10 +421,11 @@ def test_checkout_endpoint_success(db, qrisgate_client, qrisgate_user):
     assert tx is not None
     assert tx.status == "PENDING"
     assert tx.paid_at is None
-    assert tx.amount == PRO_SUBSCRIPTION_AMOUNT_IDR
+    assert tx.amount == 29000
+    assert mock_create.call_args.kwargs["amount"] == 29000
     assert tx.provider == "qrisgate"
     assert tx.revenue_classification == "REAL"
-    assert tx.total_amount == 49005
+    assert tx.total_amount == 29005
     assert tx.unique_code == 5
 
 
@@ -545,7 +549,7 @@ def test_masked_external_order_reconciliation_activates_once(db, qrisgate_user):
     tx = PaymentTransaction(
         user_id=qrisgate_user.id,
         amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
-        total_amount=49009,
+        total_amount=29009,
         currency="IDR",
         status="PENDING",
         provider="qrisgate",
@@ -560,7 +564,7 @@ def test_masked_external_order_reconciliation_activates_once(db, qrisgate_user):
         "external_order_id": "••••449b",
         "status": "PAID",
         "amount": PRO_SUBSCRIPTION_AMOUNT_IDR,
-        "total_amount": 49009,
+        "total_amount": 29009,
         "paid_at": "2026-11-09T14:32:10.054Z",
     }
 
@@ -591,7 +595,7 @@ def test_masked_external_order_rejects_invalid_values(authoritative, expected):
     assert qrisgate_external_order_matches(authoritative, expected) is False
 
 
-def test_authoritative_amount_mismatch_is_rejected(db, qrisgate_user):
+def test_previous_price_is_rejected_for_new_transaction(db, qrisgate_user):
     tx = PaymentTransaction(
         user_id=qrisgate_user.id,
         plan="pro",
@@ -609,7 +613,7 @@ def test_authoritative_amount_mismatch_is_rejected(db, qrisgate_user):
         "id": tx.provider_payment_id,
         "external_order_id": tx.external_id,
         "status": "PAID",
-        "amount": 1000,
+        "amount": 49000,
         "currency": "IDR",
     }
     with patch("app.services.payment_service.get_qrisgate_transaction", return_value=authoritative):

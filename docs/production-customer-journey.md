@@ -7,7 +7,7 @@ Use a brand-new smoke-test account and record timestamps, transaction IDs, scree
 - [ ] 3. Confirm the new account starts on Free with no paid transaction or Pro expiration.
 - [ ] 4. Create up to three HTTP monitors at the 5-minute interval, one heartbeat, and one public status page.
 - [ ] 5. Attempt to exceed each Free quota and confirm the API and UI reject the request without deleting existing resources.
-- [ ] 6. Open Billing & Plan and confirm Free status, quota usage, Rp49.000 price, 30-day access, and manual renewal copy.
+- [ ] 6. Open Billing & Plan and confirm Free status, quota usage, Rp29.000 soft-launch price, 30-day access, and manual renewal copy.
 - [ ] 7. Create a QRISGate checkout and record the local transaction ID, external order ID, provider reference, amount, and expiration.
 - [ ] 8. Before payment, confirm the transaction remains `PENDING`, `paid_at` is empty, and the account remains Free.
 - [ ] 9. Complete an approved QRISGate test payment, or have the owner manually complete the real payment when a production smoke test is authorized.

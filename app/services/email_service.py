@@ -18,6 +18,7 @@ from app.models.notification import Notification
 from app.models.notification_preference import NotificationPreference
 from app.models.subscription import UserSubscription
 from app.models.user import User
+from app.services.plan_config import PRO_PRICE_IDR
 
 logger = logging.getLogger("raytech.email")
 
@@ -521,7 +522,7 @@ Subscription Details:
 - Remaining Time: {time_badge}
 - Auto-Renewal: Non-recurring (Manual renewal)
 
-Extend Pro (+30 Days for IDR 49,000):
+Extend Pro (+30 Days for IDR {PRO_PRICE_IDR:,}):
 {safe_billing_link}
 
 Note:
@@ -655,7 +656,7 @@ What happens next?
 - You can reactivate Pro at any time to immediately unrestrict all monitors.
 - No automatic charges have occurred.
 
-Reactivate Pro (+30 Days for IDR 49,000):
+Reactivate Pro (+30 Days for IDR {PRO_PRICE_IDR:,}):
 {safe_billing_link}
 
 Raytech Cloud Services — https://monitor.raytech.cloud

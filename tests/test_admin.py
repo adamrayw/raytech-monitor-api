@@ -38,6 +38,17 @@ def test_revenue_excludes_non_real_and_non_paid_transactions(client, db, test_us
         ),
         PaymentTransaction(
             user_id=test_user.id,
+            external_id="admin_real_paid_current_price",
+            provider="qrisgate",
+            provider_mode="live",
+            revenue_classification="REAL",
+            amount=29000,
+            currency="IDR",
+            status="PAID",
+            paid_at=now,
+        ),
+        PaymentTransaction(
+            user_id=test_user.id,
             external_id="admin_sandbox_paid",
             provider="qrisgate",
             provider_mode="sandbox",
@@ -76,8 +87,8 @@ def test_revenue_excludes_non_real_and_non_paid_transactions(client, db, test_us
 
     assert response.status_code == 200
     payments = response.json()["payments"]
-    assert payments["real_paid_transactions"] == 1
-    assert payments["revenue_all_time"] == 49000
+    assert payments["real_paid_transactions"] == 2
+    assert payments["revenue_all_time"] == 78000
     assert payments["unknown_revenue_classification"] == 1
 
 

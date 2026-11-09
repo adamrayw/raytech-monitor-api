@@ -8,11 +8,12 @@ from typing import Any
 
 import httpx
 
+from app.services.plan_config import PRO_PLAN_ID, PRO_SUBSCRIPTION_DURATION_DAYS
+
 logger = logging.getLogger("raytech.duitku")
 
+# Compatibility default for archived Duitku transactions and provider fixtures.
 PRO_SUBSCRIPTION_AMOUNT_IDR = 49000
-PRO_SUBSCRIPTION_DURATION_DAYS = 30
-PRO_PLAN_ID = "pro"
 
 OFFICIAL_DUITKU_SANDBOX_BASE = "https://sandbox.duitku.com"
 OFFICIAL_DUITKU_PROD_BASE = "https://passport.duitku.com"
@@ -312,7 +313,7 @@ def verify_duitku_callback_signature(
         )
         return False
 
-    # Amount as formatted in string (e.g. '49000' or 49000)
+    # Preserve the provider's original amount representation when signing.
     str_amount = str(amount).strip()
     string_to_sign = f"{merchant_code}{str_amount}{merchant_order_id}"
     expected_sig = hmac.new(

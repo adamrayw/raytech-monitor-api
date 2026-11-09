@@ -24,9 +24,8 @@ from app.services.qrisgate_service import (
 )
 from app.services.subscription_service import activate_pro_from_payment, utcnow
 from app.services.product_event_service import record_product_event
+from app.services.plan_config import PRO_SUBSCRIPTION_DURATION_DAYS
 from app.services.xendit_service import (
-    PRO_SUBSCRIPTION_AMOUNT_IDR,
-    PRO_SUBSCRIPTION_DURATION_DAYS,
     XenditApiError,
     XenditConfigurationError,
     get_xendit_invoice,
@@ -292,11 +291,16 @@ def reconcile_and_process_payment(
         except (ValueError, TypeError):
             authoritative_amount = 0
 
-        if authoritative_amount != PRO_SUBSCRIPTION_AMOUNT_IDR:
-            logger.error(f"Duitku authoritative amount mismatch on tx {tx.id}: expected {PRO_SUBSCRIPTION_AMOUNT_IDR}, got {authoritative_amount}")
+        if authoritative_amount != tx.amount:
+            logger.error(
+                "Duitku authoritative amount mismatch on tx %s: expected %s, got %s",
+                tx.id,
+                tx.amount,
+                authoritative_amount,
+            )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={"error": f"Amount must be IDR {PRO_SUBSCRIPTION_AMOUNT_IDR}"},
+                detail={"error": f"Amount must be IDR {tx.amount}"},
             )
 
         normalized_status, raw_status_code = interpret_duitku_status(status_data)
@@ -404,11 +408,16 @@ def reconcile_and_process_payment(
     except (ValueError, TypeError):
         authoritative_amount = 0
 
-    if authoritative_amount != PRO_SUBSCRIPTION_AMOUNT_IDR:
-        logger.error(f"Authoritative amount mismatch on tx {tx.id}: expected {PRO_SUBSCRIPTION_AMOUNT_IDR}, got {authoritative_amount}")
+    if authoritative_amount != tx.amount:
+        logger.error(
+            "Authoritative amount mismatch on tx %s: expected %s, got %s",
+            tx.id,
+            tx.amount,
+            authoritative_amount,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"error": f"Amount must be IDR {PRO_SUBSCRIPTION_AMOUNT_IDR}"},
+            detail={"error": f"Amount must be IDR {tx.amount}"},
         )
 
     authoritative_status = str(invoice.get("status", "")).strip().upper()

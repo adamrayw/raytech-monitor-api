@@ -3,6 +3,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.services.plan_config import PRO_PRICE_IDR
 
 
 def utcnow() -> datetime:
@@ -72,7 +73,7 @@ class PaymentTransaction(Base):
 
     amount: Mapped[int] = mapped_column(
         Integer,
-        default=49000,
+        default=PRO_PRICE_IDR,
         nullable=False,
     )
 

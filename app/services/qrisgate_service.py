@@ -9,11 +9,15 @@ from typing import Any
 
 import httpx
 
+from app.services.plan_config import (
+    PRO_PLAN_ID,
+    PRO_PRICE_IDR,
+    PRO_SUBSCRIPTION_DURATION_DAYS,
+)
+
 logger = logging.getLogger("raytech.qrisgate")
 
-PRO_SUBSCRIPTION_AMOUNT_IDR = 49000
-PRO_SUBSCRIPTION_DURATION_DAYS = 30
-PRO_PLAN_ID = "pro"
+PRO_SUBSCRIPTION_AMOUNT_IDR = PRO_PRICE_IDR
 
 DEFAULT_QRISGATE_BASE_URL = "https://qrisgate.web.id"
 

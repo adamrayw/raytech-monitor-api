@@ -13,6 +13,7 @@ from app.models.status_page import StatusPage
 from app.models.subscription import UserSubscription
 from app.models.subscription_audit import SubscriptionAuditLog
 from app.models.user import User
+from app.services.plan_config import PRO_PRICE_IDR
 from app.services.product_event_service import record_product_event
 
 logger = logging.getLogger(__name__)
@@ -51,9 +52,9 @@ PLAN_CONFIG: dict[str, dict[str, Any]] = {
     "pro": {
         "id": "pro",
         "name": "Pro",
-        "price_display": "Rp49.000",
-        "price_raw": 49000,
-        "billing_period": "/ month",
+        "price_display": f"Rp{PRO_PRICE_IDR:,}".replace(",", "."),
+        "price_raw": PRO_PRICE_IDR,
+        "billing_period": "/ 30 days",
         "description": "Advanced monitoring and alerting for production applications.",
         "max_http_monitors": 20,
         "min_http_interval_seconds": 60,

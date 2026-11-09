@@ -105,7 +105,7 @@ def test_client_cannot_override_amount_or_duration(db, non_legacy_free_user, buy
         "id": "qrg_fixed_price",
         "checkout_url": "https://qrisgate.web.id/pay/fixed",
         "qr_string": "mock_qr",
-        "total_amount": 49000,
+        "total_amount": 29000,
         "unique_code": 0,
         "expires_at": (utcnow() + timedelta(minutes=15)).isoformat(),
     }
@@ -113,8 +113,8 @@ def test_client_cannot_override_amount_or_duration(db, non_legacy_free_user, buy
         res = buyer_client.post("/billing/checkout", json={"plan": "pro", "amount": 1000})
         assert res.status_code == 200
         tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == res.json()["transaction_id"]))
-        assert tx.amount == 49000
-        assert mock_create.call_args.kwargs["amount"] == 49000
+        assert tx.amount == 29000
+        assert mock_create.call_args.kwargs["amount"] == 29000
 
 
 def test_rapid_duplicate_checkout_reuses_active_pending_session(db, non_legacy_free_user, buyer_client):
@@ -122,7 +122,7 @@ def test_rapid_duplicate_checkout_reuses_active_pending_session(db, non_legacy_f
     tx_existing = PaymentTransaction(
         user_id=non_legacy_free_user.id,
         plan="pro",
-        amount=49000,
+        amount=29000,
         currency="IDR",
         status="PENDING",
         external_id="rtm_pro_existing_123",

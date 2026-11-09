@@ -13,11 +13,9 @@ from app.models.payment_transaction import PaymentTransaction
 from app.models.user import User
 from app.services.duitku_service import get_duitku_api_key
 from app.services.payment_service import reconcile_and_process_payment
+from app.services.plan_config import PRO_PLAN_ID, PRO_PRICE_IDR
 from app.services.product_event_service import record_product_event
 from app.services.qrisgate_service import (
-    PRO_PLAN_ID,
-    PRO_SUBSCRIPTION_AMOUNT_IDR,
-    PRO_SUBSCRIPTION_DURATION_DAYS,
     QRISGateApiError,
     QRISGateConfigurationError,
     QRISGateInsufficientCreditError,
@@ -44,7 +42,7 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 
 @router.get("/payment-methods", summary="List available payment methods from gateway")
 def list_payment_methods(
-    amount: int = Query(default=PRO_SUBSCRIPTION_AMOUNT_IDR, description="Transaction amount in IDR"),
+    amount: int = Query(default=PRO_PRICE_IDR, description="Transaction amount in IDR"),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Returns the list of available payment methods for QRISGate gateway."""
@@ -54,7 +52,7 @@ def list_payment_methods(
         window_seconds=60.0,
         error_detail="Too many payment method requests. Please wait before refreshing.",
     )
-    enforced_amount = PRO_SUBSCRIPTION_AMOUNT_IDR
+    enforced_amount = PRO_PRICE_IDR
     methods = get_qrisgate_payment_methods()
     categories = [{"key": "qr", "label": "QR Payment"}]
 
@@ -97,7 +95,7 @@ def create_checkout_session(
     """Creates a local pending payment transaction and requests a checkout session from QRISGate.
 
     QRISGate is the sole active payment provider.
-    Price and duration are authoritative on the backend (IDR 49,000 for 30 days).
+    Price and duration are authoritative on the backend (IDR 29,000 for 30 days).
     Client cannot supply custom amounts or duration.
     """
     api_rate_limiter.check_or_raise(
@@ -137,6 +135,7 @@ def create_checkout_session(
             PaymentTransaction.user_id == current_user.id,
             PaymentTransaction.status == "PENDING",
             PaymentTransaction.provider == "qrisgate",
+            PaymentTransaction.amount == PRO_PRICE_IDR,
             PaymentTransaction.created_at >= fifteen_mins_ago,
             PaymentTransaction.checkout_url.isnot(None),
         )
@@ -176,11 +175,11 @@ def create_checkout_session(
     # 2. Generate unique external order reference
     external_id = generate_qrisgate_order_id(current_user.id)
 
-    # 3. Create local pending transaction record (authoritative price: IDR 49,000)
+    # 3. Create local pending transaction record at the authoritative backend price
     tx = PaymentTransaction(
         user_id=current_user.id,
         plan=PRO_PLAN_ID,
-        amount=PRO_SUBSCRIPTION_AMOUNT_IDR,
+        amount=PRO_PRICE_IDR,
         currency="IDR",
         status="PENDING",
         provider="qrisgate",

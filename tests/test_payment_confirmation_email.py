@@ -82,7 +82,7 @@ def test_verified_paid_transaction_queues_one_email(db, buyer_user, test_client_
     tx = PaymentTransaction(
         user_id=buyer_user.id,
         plan="pro",
-        amount=49000,
+        amount=29000,
         currency="IDR",
         status="PENDING",
         provider="xendit",
@@ -98,7 +98,7 @@ def test_verified_paid_transaction_queues_one_email(db, buyer_user, test_client_
         "id": tx.provider_payment_id,
         "external_id": tx.external_id,
         "status": "PAID",
-        "amount": 49000,
+        "amount": 29000,
         "currency": "IDR",
         "payment_method": "QRIS",
         "payment_channel": "QRIS",
@@ -125,7 +125,7 @@ def test_verified_paid_transaction_queues_one_email(db, buyer_user, test_client_
     assert d.recipient_email == "buyer@raytech.cloud"
     assert d.status == "pending"
     assert "Your Raytech Monitor Pro payment is confirmed" in d.subject
-    assert "IDR 49,000" in d.body_text
+    assert "IDR 29,000" in d.body_text
     assert tx.external_id in d.body_text
     assert "View Billing & Plan" in d.body_text
 
@@ -468,7 +468,7 @@ def test_html_escaping_prevents_injection():
         customer_name=malicious_name,
         recipient_email="victim@raytech.cloud",
         transaction_reference="ref_12345",
-        amount_idr=49000,
+        amount_idr=29000,
         paid_at=utcnow(),
         duration_days=30,
         expiration_date=utcnow() + timedelta(days=30),
@@ -487,7 +487,7 @@ def test_plaintext_body_contains_required_details():
         customer_name="Jane Doe",
         recipient_email="jane@raytech.cloud",
         transaction_reference="rtm_pro_ref_999",
-        amount_idr=49000,
+        amount_idr=29000,
         paid_at=utcnow(),
         duration_days=30,
         expiration_date=utcnow() + timedelta(days=30),
@@ -495,7 +495,7 @@ def test_plaintext_body_contains_required_details():
     )
 
     assert "Raytech Monitor Pro" in text_content
-    assert "IDR 49,000" in text_content
+    assert "IDR 29,000" in text_content
     assert "rtm_pro_ref_999" in text_content
     assert "BCA Virtual Account" in text_content
     assert "does not automatically renew" in text_content

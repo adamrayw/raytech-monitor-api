@@ -91,8 +91,8 @@ def test_first_http_monitor_records_activation_once(client, db, test_user):
 def test_verified_payment_events_are_idempotent(db, other_user):
     tx = PaymentTransaction(
         user_id=other_user.id,
-        amount=49000,
-        total_amount=49007,
+        amount=29000,
+        total_amount=29007,
         currency="IDR",
         status="PENDING",
         provider="qrisgate",
@@ -108,8 +108,8 @@ def test_verified_payment_events_are_idempotent(db, other_user):
         "id": tx.provider_payment_id,
         "external_order_id": "••••449b",
         "status": "PAID",
-        "amount": 49000,
-        "total_amount": 49007,
+        "amount": 29000,
+        "total_amount": 29007,
         "paid_at": datetime.now(timezone.utc).isoformat(),
     }
     with (
@@ -127,14 +127,14 @@ def test_verified_payment_events_are_idempotent(db, other_user):
 
     assert first_outcome == "activated"
     assert second_outcome == "already_paid"
-    assert int(
-        db.scalar(
-            select(func.count(ProductEvent.id)).where(
-                ProductEvent.event_name == "payment_succeeded",
-                ProductEvent.user_id == other_user.id,
-            )
-        ) or 0
-    ) == 1
+    payment_events = db.scalars(
+        select(ProductEvent).where(
+            ProductEvent.event_name == "payment_succeeded",
+            ProductEvent.user_id == other_user.id,
+        )
+    ).all()
+    assert len(payment_events) == 1
+    assert payment_events[0].properties["amount"] == 29000
     assert int(
         db.scalar(
             select(func.count(ProductEvent.id)).where(

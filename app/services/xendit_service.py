@@ -7,11 +7,12 @@ from typing import Any
 
 import httpx
 
+from app.services.plan_config import PRO_PLAN_ID, PRO_SUBSCRIPTION_DURATION_DAYS
+
 logger = logging.getLogger("raytech.xendit")
 
+# Compatibility default for archived Xendit transactions and provider fixtures.
 PRO_SUBSCRIPTION_AMOUNT_IDR = 49000
-PRO_SUBSCRIPTION_DURATION_DAYS = 30
-PRO_PLAN_ID = "pro"
 
 OFFICIAL_XENDIT_BASE_URL = "https://api.xendit.co"
 TEST_KEY_PREFIX = "xnd_development_"
