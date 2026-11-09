@@ -311,7 +311,7 @@ def render_payment_confirmation_email(
 
     paid_at_str = paid_at.strftime("%d %b %Y, %H:%M UTC")
     expiry_str = expiration_date.strftime("%d %b %Y, %H:%M UTC") if expiration_date else f"{duration_days} days from payment"
-    channel_str = payment_channel or "Xendit Sandbox Checkout"
+    channel_str = payment_channel or "QRISGate"
     greeting_name = customer_name.strip() if customer_name and customer_name.strip() else recipient_email
 
     # Plain-text alternative

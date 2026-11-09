@@ -232,7 +232,7 @@ def startup():
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     subscription_id INTEGER REFERENCES user_subscriptions(id) ON DELETE SET NULL,
-                    provider VARCHAR(32) NOT NULL DEFAULT 'xendit',
+                    provider VARCHAR(32) NOT NULL DEFAULT 'qrisgate',
                     provider_payment_id VARCHAR(128),
                     provider_session_id VARCHAR(128),
                     external_id VARCHAR(128) UNIQUE NOT NULL,
@@ -260,7 +260,9 @@ def startup():
             try:
                 conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS va_number VARCHAR(64);"))
                 conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS qr_string TEXT;"))
-                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS provider_mode VARCHAR(32) NOT NULL DEFAULT 'sandbox';"))
+                conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS provider_mode VARCHAR(32) NOT NULL DEFAULT 'live';"))
+                conn.execute(text("ALTER TABLE payment_transactions ALTER COLUMN provider SET DEFAULT 'qrisgate';"))
+                conn.execute(text("ALTER TABLE payment_transactions ALTER COLUMN provider_mode SET DEFAULT 'live';"))
                 conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS unique_code INTEGER;"))
                 conn.execute(text("ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS total_amount INTEGER;"))
                 conn.execute(text("""
@@ -292,11 +294,6 @@ def startup():
     except Exception:
         pass
 
-    try:
-        from app.services.xendit_service import validate_xendit_environment
-        validate_xendit_environment()
-    except Exception as exc:
-        logger.warning(f"Xendit environment check: {exc}")
 
     try:
         from app.services.qrisgate_service import validate_qrisgate_environment

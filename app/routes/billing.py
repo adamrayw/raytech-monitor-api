@@ -11,14 +11,7 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.models.payment_transaction import PaymentTransaction
 from app.models.user import User
-from app.services.duitku_service import (
-    create_duitku_transaction,
-    generate_duitku_order_id,
-    get_duitku_api_key,
-    get_duitku_mode,
-    get_duitku_payment_methods,
-    is_user_allowed_sandbox_checkout,
-)
+from app.services.duitku_service import get_duitku_api_key
 from app.services.payment_service import reconcile_and_process_payment
 from app.services.qrisgate_service import (
     PRO_PLAN_ID,
@@ -102,7 +95,7 @@ def create_checkout_session(
 ) -> dict[str, Any]:
     """Creates a local pending payment transaction and requests a checkout session from QRISGate.
 
-    Duitku and Xendit payment gateways have been disabled. QRISGate is the sole active payment provider.
+    QRISGate is the sole active payment provider.
     Price and duration are authoritative on the backend (IDR 49,000 for 30 days).
     Client cannot supply custom amounts or duration.
     """
@@ -123,15 +116,12 @@ def create_checkout_session(
         )
 
     requested_provider = (payload.provider or "qrisgate").strip().lower()
-    if requested_provider in ("duitku", "xendit"):
+    if requested_provider != "qrisgate":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
-                "code": "GATEWAY_DISABLED",
-                "message": (
-                    f"Gateway pembayaran '{requested_provider}' telah dinonaktifkan. "
-                    "QRISGate adalah gateway pembayaran aktif."
-                ),
+                "code": "UNSUPPORTED_PROVIDER",
+                "message": "QRISGate adalah gateway pembayaran aktif.",
             },
         )
 

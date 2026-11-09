@@ -544,7 +544,7 @@ def activate_pro_from_payment(
     transaction_id: int,
     duration_days: int = 30,
     commit: bool = True,
-    provider: str = "duitku",
+    provider: str = "qrisgate",
 ) -> UserSubscription:
     """Activates or extends 30 days of Pro entitlements after a verified payment.
 

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.models.user import User
+from app.services.qrisgate_service import get_qrisgate_api_key
 from app.services.subscription_service import (
     PLAN_CONFIG,
     get_entitlements,
@@ -82,16 +83,11 @@ def get_user_subscription(
 
     if is_pro:
         if latest_paid_tx:
-            if latest_paid_tx.provider == "duitku":
-                mode_str = " (Sandbox)" if latest_paid_tx.provider_mode == "sandbox" else ""
+            if latest_paid_tx.provider == "qrisgate":
                 method_name = latest_paid_tx.payment_method or "QRIS"
-                payment_method = f"Duitku {method_name}{mode_str}"
-            elif latest_paid_tx.provider == "xendit":
-                channel_info = f" ({latest_paid_tx.payment_channel})" if latest_paid_tx.payment_channel else ""
-                payment_method = f"Xendit (Historical){channel_info}"
+                payment_method = f"QRISGate ({method_name})"
             else:
-                channel_info = f" ({latest_paid_tx.payment_channel})" if latest_paid_tx.payment_channel else ""
-                payment_method = f"{latest_paid_tx.provider}{channel_info}"
+                payment_method = "Previous payment gateway"
         elif getattr(sub, "legacy_override", False):
             payment_method = "Legacy Grandfathered"
         else:
@@ -113,9 +109,7 @@ def get_user_subscription(
     end_wib = format_wib_datetime(sub.current_period_end) if sub.current_period_end else None
     is_expired_pro = (sub.status == "expired") or (not is_pro and tx_count > 0)
 
-    from app.services.duitku_service import is_user_allowed_sandbox_checkout
-
-    sandbox_checkout_allowed = is_user_allowed_sandbox_checkout(current_user)
+    checkout_allowed = bool(get_qrisgate_api_key())
 
     billing_summary = {
         "plan_id": plan_id,
@@ -127,8 +121,8 @@ def get_user_subscription(
         "renewal_date": sub.current_period_end.isoformat() if (is_pro and sub.current_period_end) else None,
         "invoices_count": tx_count,
         "auto_renew": False,
-        "checkout_allowed": sandbox_checkout_allowed,
-        "checkout_mode": "sandbox",
+        "checkout_allowed": checkout_allowed,
+        "checkout_mode": "live",
     }
 
     return {
@@ -148,7 +142,7 @@ def get_user_subscription(
         "cancel_at_period_end": sub.cancel_at_period_end,
         "legacy_override": sub.legacy_override,
         "upgrade_available": not is_pro,
-        "sandbox_checkout_allowed": sandbox_checkout_allowed,
+        "checkout_allowed": checkout_allowed,
         "payment_method": payment_method,
         "billing_cycle": billing_cycle,
         "renewal_date": sub.current_period_end.isoformat() if (is_pro and sub.current_period_end) else None,

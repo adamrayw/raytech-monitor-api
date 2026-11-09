@@ -150,6 +150,7 @@ def reconcile_and_process_payment(
                 transaction_id=tx.id,
                 duration_days=PRO_SUBSCRIPTION_DURATION_DAYS,
                 commit=False,
+                provider="qrisgate",
             )
 
             user = db.get(User, tx.user_id)

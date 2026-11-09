@@ -287,6 +287,7 @@ def test_webhook_payment_paid_fulfillment(db, qrisgate_client, qrisgate_user):
     assert plan == "pro"
     assert sub.status == "active"
     assert sub.current_period_end is not None
+    assert sub.override_reason == f"qrisgate_payment:{tx.id}"
 
     # Verify confirmation email delivery enqueued
     delivery = db.scalar(
@@ -395,16 +396,16 @@ def test_checkout_endpoint_success(db, qrisgate_client, qrisgate_user):
     assert tx.unique_code == 5
 
 
-def test_checkout_rejects_disabled_duitku(qrisgate_client):
-    """Requesting Duitku checkout returns HTTP 400 with GATEWAY_DISABLED message."""
+def test_checkout_rejects_unsupported_provider(qrisgate_client):
+    """Checkout accepts QRISGate as the sole active payment provider."""
     resp = qrisgate_client.post(
         "/billing/checkout",
-        json={"plan": "pro", "provider": "duitku"},
+        json={"plan": "pro", "provider": "unsupported"},
     )
     assert resp.status_code == 400
     data = resp.json()
-    assert data.get("detail", {}).get("code") == "GATEWAY_DISABLED"
-    assert "dinonaktifkan" in data.get("detail", {}).get("message").lower()
+    assert data.get("detail", {}).get("code") == "UNSUPPORTED_PROVIDER"
+    assert "qrisgate" in data.get("detail", {}).get("message").lower()
 
 
 def test_checkout_handles_402_merchant_credit_exhausted(qrisgate_client):

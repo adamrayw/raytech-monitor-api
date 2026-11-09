@@ -27,14 +27,14 @@ class PaymentTransaction(Base):
 
     provider: Mapped[str] = mapped_column(
         String(32),
-        default="xendit",
+        default="qrisgate",
         index=True,
         nullable=False,
     )
 
     provider_mode: Mapped[str] = mapped_column(
         String(32),
-        default="sandbox",
+        default="live",
         index=True,
         nullable=False,
     )
