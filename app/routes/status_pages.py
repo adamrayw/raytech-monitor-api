@@ -23,6 +23,7 @@ from app.services.status_page_service import (
     verify_user_monitors_ownership,
 )
 from app.services.subscription_service import enforce_status_page_quota
+from app.services.product_event_service import record_product_event
 
 router = APIRouter(prefix="/status-pages", tags=["status-pages"])
 
@@ -172,6 +173,29 @@ def create_status_page(
         )
         db.add(spm)
 
+    record_product_event(
+        db,
+        event_name="status_page_created",
+        user_id=current_user.id,
+        source="api",
+        properties={"status_page_id": page.id, "published": page.is_published},
+        idempotency_key=f"status_page_created:{page.id}",
+    )
+    page_count = int(
+        db.scalar(
+            select(func.count(StatusPage.id)).where(StatusPage.user_id == current_user.id)
+        ) or 0
+    )
+    if page_count == 1:
+        record_product_event(
+            db,
+            event_name="first_status_page_created",
+            user_id=current_user.id,
+            source="api",
+            properties={"status_page_id": page.id},
+            idempotency_key=f"first_status_page_created:{current_user.id}",
+        )
+
     db.commit()
     db.refresh(page)
 
@@ -298,6 +322,14 @@ def delete_status_page(
             detail="Status page not found.",
         )
 
+    record_product_event(
+        db,
+        event_name="status_page_deleted",
+        user_id=current_user.id,
+        source="api",
+        properties={"status_page_id": page.id},
+        idempotency_key=f"status_page_deleted:{page.id}",
+    )
     db.delete(page)
     db.commit()
 

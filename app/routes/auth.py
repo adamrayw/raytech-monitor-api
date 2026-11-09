@@ -1,4 +1,5 @@
 import os
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -8,6 +9,7 @@ from app.dependencies.auth import get_current_user
 from app.database import get_db
 from app.models.user import User
 from app.services.oauth import oauth
+from app.services.product_event_service import record_product_event
 
 
 router = APIRouter(
@@ -37,6 +39,7 @@ async def google_login(request: Request):
         window_seconds=60.0,
         error_detail="Too many login attempts. Please wait a minute before retrying.",
     )
+    request.session["analytics_auth_attempt_id"] = secrets.token_urlsafe(16)
     return await oauth.google.authorize_redirect(
         request,
         GOOGLE_REDIRECT_URI,
@@ -80,6 +83,7 @@ async def google_callback(
             )
         )
 
+    is_new_user = user is None
     if user is None:
         user = User(
             email=email,
@@ -87,21 +91,43 @@ async def google_callback(
             picture=userinfo.get("picture"),
             google_sub=google_sub,
             is_active=True,
+            launch_cohort="public",
         )
 
         db.add(user)
+        db.flush()
 
     else:
         user.google_sub = google_sub
         user.name = userinfo.get("name") or user.name
         user.picture = userinfo.get("picture") or user.picture
 
+    auth_attempt_id = str(
+        request.session.get("analytics_auth_attempt_id") or secrets.token_urlsafe(16)
+    )
+    if is_new_user:
+        record_product_event(
+            db,
+            event_name="user_signed_up",
+            user_id=user.id,
+            source="api",
+            properties={"launch_cohort": user.launch_cohort},
+            idempotency_key=f"user_signed_up:{user.id}",
+        )
+    record_product_event(
+        db,
+        event_name="user_logged_in",
+        user_id=user.id,
+        source="api",
+        idempotency_key=f"user_logged_in:{auth_attempt_id}",
+    )
     db.commit()
     db.refresh(user)
 
     # Session fixation defense: regenerate/clear prior anonymous session state before setting user id
     request.session.clear()
     request.session["user_id"] = user.id
+    request.session["analytics_login_session_id"] = auth_attempt_id
 
     return RedirectResponse(
         url=f"{FRONTEND_URL}/app",
@@ -121,7 +147,24 @@ def me(
     }
 
 @router.post("/logout")
-async def logout(request: Request):
+async def logout(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    user_id = request.session.get("user_id")
+    login_session_id = request.session.get("analytics_login_session_id")
+    if isinstance(user_id, int) and db.get(User, user_id) is not None:
+        record_product_event(
+            db,
+            event_name="user_logged_out",
+            user_id=user_id,
+            source="api",
+            idempotency_key=(
+                f"user_logged_out:{login_session_id}"
+                if login_session_id else None
+            ),
+        )
+        db.commit()
     request.session.clear()
 
     return {

@@ -22,6 +22,7 @@ from app.services.email_service import (
     is_test_mode,
 )
 from app.services.subscription_service import enforce_email_access
+from app.services.product_event_service import record_product_event
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -98,7 +99,8 @@ def update_notification_settings(
     pref = get_or_create_preferences(db, current_user.id)
 
     update_data = payload.model_dump(exclude_unset=True)
-    if update_data.get("email_enabled") is True and not pref.email_enabled:
+    email_was_enabled = pref.email_enabled
+    if update_data.get("email_enabled") is True and not email_was_enabled:
         enforce_email_access(db, current_user.id)
 
     for field, value in update_data.items():
@@ -106,6 +108,14 @@ def update_notification_settings(
             setattr(pref, field, value)
 
     pref.updated_at = utcnow()
+    if pref.email_enabled and not email_was_enabled:
+        record_product_event(
+            db,
+            event_name="email_alerts_enabled",
+            user_id=current_user.id,
+            source="api",
+            idempotency_key=f"email_alerts_enabled:{current_user.id}",
+        )
     db.commit()
     db.refresh(pref)
 

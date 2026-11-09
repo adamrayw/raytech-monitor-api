@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -14,6 +14,7 @@ from app.models.heartbeat_event import HeartbeatEvent
 from app.models.incident import Incident
 from app.models.user import User
 from app.services.heartbeat_service import generate_heartbeat_token
+from app.services.product_event_service import record_product_event
 from app.services.subscription_service import (
     enforce_http_interval,
     enforce_monitor_creation_quota,
@@ -151,6 +152,35 @@ async def create_monitor(
             ssl_next_check_at=None,
         )
         db.add(monitor)
+        db.flush()
+        record_product_event(
+            db,
+            event_name="heartbeat_created",
+            user_id=user.id,
+            source="api",
+            properties={
+                "monitor_id": monitor.id,
+                "expected_interval_seconds": monitor.expected_interval_seconds,
+            },
+            idempotency_key=f"heartbeat_created:{monitor.id}",
+        )
+        heartbeat_count = int(
+            db.scalar(
+                select(func.count(Monitor.id)).where(
+                    Monitor.user_id == user.id,
+                    Monitor.type == "heartbeat",
+                )
+            ) or 0
+        )
+        if heartbeat_count == 1:
+            record_product_event(
+                db,
+                event_name="first_heartbeat_created",
+                user_id=user.id,
+                source="api",
+                properties={"monitor_id": monitor.id},
+                idempotency_key=f"first_heartbeat_created:{user.id}",
+            )
         db.commit()
         db.refresh(monitor)
 
@@ -200,6 +230,61 @@ async def create_monitor(
     )
 
     db.add(monitor)
+    db.flush()
+    record_product_event(
+        db,
+        event_name="monitor_created",
+        user_id=user.id,
+        source="api",
+        properties={
+            "monitor_id": monitor.id,
+            "monitor_type": "http",
+            "interval_seconds": monitor.interval_seconds,
+            "ssl_enabled": monitor.ssl_monitoring_enabled,
+        },
+        idempotency_key=f"monitor_created:{monitor.id}",
+    )
+    http_monitor_count = int(
+        db.scalar(
+            select(func.count(Monitor.id)).where(
+                Monitor.user_id == user.id,
+                Monitor.type == "http",
+            )
+        ) or 0
+    )
+    if http_monitor_count == 1:
+        user_created_at = user.created_at
+        if user_created_at.tzinfo is None:
+            user_created_at = user_created_at.replace(tzinfo=timezone.utc)
+        time_to_activation = max(0, int((utcnow() - user_created_at).total_seconds()))
+        record_product_event(
+            db,
+            event_name="first_monitor_created",
+            user_id=user.id,
+            source="api",
+            properties={
+                "monitor_id": monitor.id,
+                "time_to_activation_seconds": time_to_activation,
+            },
+            idempotency_key=f"first_monitor_created:{user.id}",
+        )
+        record_product_event(
+            db,
+            event_name="onboarding_completed",
+            user_id=user.id,
+            source="api",
+            properties={"time_to_activation_seconds": time_to_activation},
+            idempotency_key=f"onboarding_completed:{user.id}",
+        )
+    if monitor.ssl_monitoring_enabled:
+        record_product_event(
+            db,
+            event_name="ssl_monitor_enabled",
+            user_id=user.id,
+            source="api",
+            properties={"monitor_id": monitor.id},
+            idempotency_key=f"ssl_monitor_enabled:{monitor.id}",
+        )
     db.commit()
     db.refresh(monitor)
 
@@ -387,6 +472,24 @@ async def update_monitor(
         monitor.consecutive_successes = 0
         monitor.next_check_at = utcnow()
 
+    if "is_active" in updates and monitor.is_active != previous_active:
+        record_product_event(
+            db,
+            event_name="monitor_resumed" if monitor.is_active else "monitor_paused",
+            user_id=user.id,
+            source="api",
+            properties={"monitor_id": monitor.id, "monitor_type": monitor.type},
+        )
+    if monitor.ssl_monitoring_enabled and not previous_ssl_enabled:
+        record_product_event(
+            db,
+            event_name="ssl_monitor_enabled",
+            user_id=user.id,
+            source="api",
+            properties={"monitor_id": monitor.id},
+            idempotency_key=f"ssl_monitor_enabled:{monitor.id}",
+        )
+
     db.commit()
     db.refresh(monitor)
 
@@ -404,6 +507,18 @@ def delete_monitor(
 ):
     monitor = get_owned_monitor(monitor_id, user, db)
 
+    event_name = "heartbeat_deleted" if monitor.type == "heartbeat" else "monitor_deleted"
+    properties: dict[str, int | str] = {"monitor_id": monitor.id}
+    if event_name == "monitor_deleted":
+        properties["monitor_type"] = monitor.type
+    record_product_event(
+        db,
+        event_name=event_name,
+        user_id=user.id,
+        source="api",
+        properties=properties,
+        idempotency_key=f"{event_name}:{monitor.id}",
+    )
     db.delete(monitor)
     db.commit()
 

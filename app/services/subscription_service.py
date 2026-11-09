@@ -13,6 +13,7 @@ from app.models.status_page import StatusPage
 from app.models.subscription import UserSubscription
 from app.models.subscription_audit import SubscriptionAuditLog
 from app.models.user import User
+from app.services.product_event_service import record_product_event
 
 logger = logging.getLogger(__name__)
 
@@ -572,6 +573,19 @@ def activate_pro_from_payment(
         payment_transaction_id=transaction_id,
         commit=False,
     )
+    product_event_name = "pro_renewed" if event_type == "pro_extended" else "pro_activated"
+    record_product_event(
+        db,
+        event_name=product_event_name,
+        user_id=user_id,
+        source="payment",
+        properties={
+            "transaction_id": transaction_id,
+            "provider": provider,
+            "period_days": duration_days,
+        },
+        idempotency_key=f"{product_event_name}:{transaction_id}",
+    )
 
     if commit:
         db.commit()
@@ -706,6 +720,15 @@ def process_subscription_expirations(db: Session) -> dict[str, Any]:
             from app.services.email_service import enqueue_subscription_expired_email
             enqueue_subscription_expired_email(db, user, sub)
 
+        period_marker = int(end_tz.timestamp())
+        record_product_event(
+            db,
+            event_name="pro_expired",
+            user_id=sub.user_id,
+            source="worker",
+            properties={"subscription_id": sub.id},
+            idempotency_key=f"pro_expired:{sub.id}:{period_marker}",
+        )
         db.commit()
         expired_count += 1
         logger.info(f"Processed expiration for user {sub.user_id}, downgraded to Free.")

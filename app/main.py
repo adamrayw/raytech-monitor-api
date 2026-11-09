@@ -27,6 +27,8 @@ from app.routes.subscription import router as subscription_router
 from app.routes.billing import router as billing_router
 from app.routes.webhooks import router as webhooks_router
 from app.routes.admin import router as admin_router
+from app.routes.analytics import router as analytics_router
+from app.routes.feedback import router as feedback_router
 
 logger = logging.getLogger("raytech.api")
 
@@ -204,6 +206,8 @@ app.include_router(billing_router)
 app.include_router(webhooks_router)
 app.include_router(webhooks_router, prefix="/api")
 app.include_router(admin_router)
+app.include_router(analytics_router)
+app.include_router(feedback_router)
 
 # Explicit aliases required by QRISGate integration specs:
 from app.routes.billing import CheckoutRequest, create_checkout_session, get_order_by_id

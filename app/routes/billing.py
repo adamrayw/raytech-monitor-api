@@ -13,6 +13,7 @@ from app.models.payment_transaction import PaymentTransaction
 from app.models.user import User
 from app.services.duitku_service import get_duitku_api_key
 from app.services.payment_service import reconcile_and_process_payment
+from app.services.product_event_service import record_product_event
 from app.services.qrisgate_service import (
     PRO_PLAN_ID,
     PRO_SUBSCRIPTION_AMOUNT_IDR,
@@ -192,6 +193,15 @@ def create_checkout_session(
         updated_at=utcnow(),
     )
     db.add(tx)
+    db.flush()
+    record_product_event(
+        db,
+        event_name="payment_pending",
+        user_id=current_user.id,
+        source="api",
+        properties={"transaction_id": tx.id, "provider": tx.provider},
+        idempotency_key=f"payment_pending:{tx.id}",
+    )
     db.commit()
     db.refresh(tx)
 
@@ -208,6 +218,14 @@ def create_checkout_session(
         )
     except QRISGateInsufficientCreditError as exc:
         tx.status = "FAILED"
+        record_product_event(
+            db,
+            event_name="payment_failed",
+            user_id=current_user.id,
+            source="api",
+            properties={"transaction_id": tx.id, "provider": tx.provider, "reason_code": "merchant_credit_exhausted"},
+            idempotency_key=f"payment_failed:{tx.id}",
+        )
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -215,6 +233,14 @@ def create_checkout_session(
         )
     except QRISGateValidationError as exc:
         tx.status = "FAILED"
+        record_product_event(
+            db,
+            event_name="payment_failed",
+            user_id=current_user.id,
+            source="api",
+            properties={"transaction_id": tx.id, "provider": tx.provider, "reason_code": "provider_validation"},
+            idempotency_key=f"payment_failed:{tx.id}",
+        )
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -227,6 +253,14 @@ def create_checkout_session(
         )
     except QRISGateConfigurationError as exc:
         tx.status = "FAILED"
+        record_product_event(
+            db,
+            event_name="payment_failed",
+            user_id=current_user.id,
+            source="api",
+            properties={"transaction_id": tx.id, "provider": tx.provider, "reason_code": "provider_configuration"},
+            idempotency_key=f"payment_failed:{tx.id}",
+        )
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -234,6 +268,14 @@ def create_checkout_session(
         )
     except QRISGateApiError as exc:
         tx.status = "FAILED"
+        record_product_event(
+            db,
+            event_name="payment_failed",
+            user_id=current_user.id,
+            source="api",
+            properties={"transaction_id": tx.id, "provider": tx.provider, "reason_code": "provider_api"},
+            idempotency_key=f"payment_failed:{tx.id}",
+        )
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -251,6 +293,19 @@ def create_checkout_session(
     parsed_exp = parse_iso_datetime(raw_exp) if raw_exp else None
     tx.expires_at = parsed_exp or (utcnow() + timedelta(minutes=15))
     tx.updated_at = utcnow()
+    record_product_event(
+        db,
+        event_name="checkout_started",
+        user_id=current_user.id,
+        source="api",
+        properties={
+            "transaction_id": tx.id,
+            "provider": tx.provider,
+            "amount": tx.amount,
+            "currency": tx.currency,
+        },
+        idempotency_key=f"checkout_started:{tx.id}",
+    )
     db.commit()
     db.refresh(tx)
 

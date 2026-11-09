@@ -52,6 +52,13 @@ class User(Base):
         nullable=False,
     )
 
+    launch_cohort: Mapped[str | None] = mapped_column(
+        String(16),
+        default="public",
+        index=True,
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,

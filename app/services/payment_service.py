@@ -23,6 +23,7 @@ from app.services.qrisgate_service import (
     get_qrisgate_transaction,
 )
 from app.services.subscription_service import activate_pro_from_payment, utcnow
+from app.services.product_event_service import record_product_event
 from app.services.xendit_service import (
     PRO_SUBSCRIPTION_AMOUNT_IDR,
     PRO_SUBSCRIPTION_DURATION_DAYS,
@@ -227,6 +228,19 @@ def reconcile_and_process_payment(
                     subscription=sub,
                 )
 
+            record_product_event(
+                db,
+                event_name="payment_succeeded",
+                user_id=tx.user_id,
+                source="payment",
+                properties={
+                    "transaction_id": tx.id,
+                    "provider": tx.provider,
+                    "amount": tx.amount,
+                    "currency": tx.currency,
+                },
+                idempotency_key=f"payment_succeeded:{tx.id}",
+            )
             db.commit()
             db.refresh(tx)
             logger.info("QRISGate payment settlement successful for user %s via tx %s", tx.user_id, tx.id)
@@ -236,6 +250,21 @@ def reconcile_and_process_payment(
             if tx.status == "PENDING":
                 tx.status = normalized_status
                 tx.updated_at = utcnow()
+                analytics_event = "payment_failed" if normalized_status == "FAILED" else "payment_expired"
+                properties: dict[str, Any] = {
+                    "transaction_id": tx.id,
+                    "provider": tx.provider,
+                }
+                if normalized_status == "FAILED":
+                    properties["reason_code"] = "provider_failed"
+                record_product_event(
+                    db,
+                    event_name=analytics_event,
+                    user_id=tx.user_id,
+                    source="payment",
+                    properties=properties,
+                    idempotency_key=f"{analytics_event}:{tx.id}",
+                )
                 db.commit()
                 db.refresh(tx)
             return "failed" if normalized_status == "FAILED" else "expired", tx

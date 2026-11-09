@@ -15,6 +15,11 @@ from app.models.service_health import ServiceHealth
 from app.models.status_page import StatusPage
 from app.models.subscription import UserSubscription
 from app.models.user import User
+from app.models.user_feedback import UserFeedback
+from app.services.product_analytics_service import (
+    build_admin_product_analytics,
+    build_soft_launch_summary,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 JAKARTA = ZoneInfo("Asia/Jakarta")
@@ -239,6 +244,7 @@ def list_admin_users(
                 "email": user.email,
                 "name": user.name,
                 "is_admin": user.is_admin,
+                "launch_cohort": user.launch_cohort,
                 "created_at": user.created_at.isoformat(),
                 "plan": "pro" if is_active_pro else "free",
                 "subscription_status": sub.status if sub else "active",
@@ -249,3 +255,65 @@ def list_admin_users(
             }
         )
     return {"count": total, "items": items}
+
+
+@router.get("/analytics")
+def get_admin_product_analytics(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> dict[str, Any]:
+    return build_admin_product_analytics(db)
+
+
+@router.get("/soft-launch")
+def get_admin_soft_launch(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> dict[str, Any]:
+    return build_soft_launch_summary(db)
+
+
+@router.get("/feedback")
+def list_admin_feedback(
+    status_filter: str | None = Query(default=None, alias="status", max_length=32),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> dict[str, Any]:
+    filters: list[Any] = []
+    if status_filter:
+        normalized_status = status_filter.strip().lower()
+        if normalized_status not in {"open", "reviewed", "closed"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid feedback status",
+            )
+        filters.append(UserFeedback.status == normalized_status)
+
+    total = int(db.scalar(select(func.count(UserFeedback.id)).where(*filters)) or 0)
+    rows = db.execute(
+        select(UserFeedback, User.email)
+        .join(User, User.id == UserFeedback.user_id)
+        .where(*filters)
+        .order_by(UserFeedback.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return {
+        "count": total,
+        "items": [
+            {
+                "id": feedback.id,
+                "user_id": feedback.user_id,
+                "user_email": email,
+                "category": feedback.category,
+                "message": feedback.message,
+                "rating": feedback.rating,
+                "page_path": feedback.page_path,
+                "status": feedback.status,
+                "created_at": feedback.created_at.isoformat(),
+            }
+            for feedback, email in rows
+        ],
+    }
